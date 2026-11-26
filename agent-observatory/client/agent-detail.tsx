@@ -21,6 +21,7 @@ import { CodeBlock, TimelineContent } from "./timeline-view";
 import { ResultView, permissionRequests } from "./result-view";
 import { SubtasksView } from "./subtasks-view";
 import { InsightsPanel } from "./insights";
+import { SendToAgentSheet } from "./insight-actions";
 import { useTimeline } from "./use-timeline";
 import { useDigest } from "./use-digest";
 import { AgentDigest } from "./agent-digest";
@@ -157,6 +158,8 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
   };
   // 已答复 / 待回复 (fork): take this Agent off 待回复 without sending it anything, or put it back. Names the reply on screen.
   const setAnswered = useRpc(setReplyAnswered), [answering, setAnswering] = useState(false);
+  // 回复 (fork): type or dictate an answer here instead of opening the session.
+  const [replying, setReplying] = useState(false);
   const markAnswered = async (answered: boolean) => {
     if (!agent.replyAskedAt) return;
     setAnswering(true);
@@ -197,13 +200,16 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
     : ackKind === "problem" ? { key: "read", label: t("coreAgentDetail.gotIt"), icon: "Check", onPress: () => void acknowledge(false), busy: reading } : null;
   const archive: Action | null = !agent.archivedAt && readState === "read" ? { key: "archive", label: t("coreAgentDetail.archive"), icon: "Archive", onPress: () => void archiveOriginal(), busy: archiving } : null;
   const restoreAction: Action | null = agent.archivedAt ? { key: "restore", label: restoring.restoring ? t("coreAgentDetail.restoring") : t("coreAgentDetail.restoreSession"), icon: "History", onPress: () => void restoreOriginal(), busy: restoring.restoring } : null;
+  const replyAction: Action | null = !agent.archivedAt && agent.status === "idle"
+    ? { key: "reply", label: t("coreAgentDetail.typeAnswer"), icon: "MessageSquareText", onPress: () => setReplying(true) } : null;
   const answeredAction: Action | null = !agent.archivedAt && agent.status === "idle" && agent.replyAskedAt && !agent.replyAnswered
     ? { key: "answered", label: t("coreAgentDetail.markAnswered"), icon: "CircleCheck", onPress: () => void markAnswered(true), busy: answering } : null;
   const snoozeAction: Action | null = (ackKind === "result" || ackKind === "question") && snooze ? { key: "snooze", label: t("coreAgentDetail.snooze"), icon: "Clock3", onPress: snooze } : null;
-  const ordered = (agent.archivedAt ? [restoreAction, open] : [open, read, compact ? null : answeredAction, compact ? null : snoozeAction, archive]).filter((item): item is Action => !!item);
+  const ordered = (agent.archivedAt ? [restoreAction, open] : [open, replyAction, read, compact ? null : answeredAction, compact ? null : snoozeAction, archive]).filter((item): item is Action => !!item);
   const variantOf = (action: Action, index: number): ButtonVariant => index === 0 ? "primary" : action.key === "read" || action.key === "next" || (agent.archivedAt && action.key === "open") ? "secondary" : "ghost";
   const menu: MenuAction[] = [
     ...(unread && onReadNext ? [{ key: "read-only", label: t("coreAgentDetail.markRead"), icon: "Check", hint: t("coreAgentDetail.stayOnThisResult"), disabled: reading || result.isPending, onPress: () => void acknowledge(false) }] : []),
+    ...(compact && replyAction && read ? [{ key: "read", label: read.label, icon: read.icon, disabled: read.disabled || read.busy, onPress: read.onPress }] : []),
     ...(compact && answeredAction ? [{ key: "answered", label: answeredAction.label, icon: answeredAction.icon, hint: t("coreAgentDetail.markAnsweredHint"), disabled: answering, onPress: answeredAction.onPress }] : []),
     ...(!agent.archivedAt && agent.replyAnswered ? [{ key: "awaiting", label: t("coreAgentDetail.markAwaitingReply"), icon: "MessageCircleQuestion", hint: t("coreAgentDetail.markAwaitingReplyHint"), disabled: answering, onPress: () => void markAnswered(false) }] : []),
     ...(compact && snoozeAction ? [{ key: "snooze", label: t("coreAgentDetail.snooze"), icon: "Clock3", hint: t("coreAgentDetail.remindIn1HourOrImmediatelyWhen"), onPress: snoozeAction.onPress }] : []),
@@ -263,7 +269,7 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
   const body = tab === "result" ? waitForTap ? <RecordedRunResult theme={theme} runId={scheduleRunId!} header={scrolled} lead={lead} inset={inset} onLoadFull={() => setFullResult(true)} />
     : recordedFallback ? <RecordedRunResult theme={theme} runId={scheduleRunId!} header={scrolled} lead={lead} inset={inset} loadLabel={t("coreAgentDetail.retryLoadingSession")} loadHint={null} loading={result.isFetching}
       notice={t("coreAgentDetail.couldNotLoadSessionTheReplyRecorded", { value1: describeRunError(result.error?.message)?.summary ?? t("coreAgentDetail.tryAgainLater") })} onLoadFull={() => void result.refetch()} />
-    : <ResultView theme={theme} agent={agent} data={result.data} loading={result.isPending} error={result.error ? knownRunError(result.error.message) ?? result.error.message : undefined} header={scrolled} lead={lead} inset={inset} pending={pending} permissions={permissions} suggestion={recap?.state === "fresh" ? recap.reply : null} onResolvePermissions={navigation ? openConversation : undefined} onPermissionsChanged={() => void pendingDetails.refetch()} compact={compact} onOpenEvidence={openEvidence} onRefresh={() => void result.refetch()} />
+    : <ResultView theme={theme} agent={agent} onTypeReply={() => setReplying(true)} data={result.data} loading={result.isPending} error={result.error ? knownRunError(result.error.message) ?? result.error.message : undefined} header={scrolled} lead={lead} inset={inset} pending={pending} permissions={permissions} suggestion={recap?.state === "fresh" ? recap.reply : null} onResolvePermissions={navigation ? openConversation : undefined} onPermissionsChanged={() => void pendingDetails.refetch()} compact={compact} onOpenEvidence={openEvidence} onRefresh={() => void result.refetch()} />
     : tab === "digest" ? <AgentDigest theme={theme} compact={compact} digest={digest.data} loading={digest.isPending} error={digest.error?.message} onRefresh={() => void digest.refetch()}
       onOpenSeq={(epoch, seq) => openEvidence(`${agent.id}:${epoch}:${seq}-${seq}`)} header={scrolled} inset={inset} />
     : tab === "timeline" ? <TimelineContent timeline={timeline} theme={theme} cacheKey={agent.id} focusRef={focusRef} header={scrolled} inset={inset} />
@@ -286,7 +292,8 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
     {body}
     {actionMenu}
   </View>;
-  const bottom = (agent.archivedAt ? [open, restoreAction] : read ? [read, open] : readState === "read" ? [archive, open] : [open]).filter((item): item is Action => !!item);
+  // Awaiting a reply on a phone: answer in Paseo, or type / dictate it here (Mark read moves to the menu).
+  const bottom = (agent.archivedAt ? [open, restoreAction] : replyAction ? [open, replyAction] : read ? [read, open] : readState === "read" ? [archive, open] : [open]).filter((item): item is Action => !!item);
   return <View testID="agent-detail" style={{ flex: 1, minHeight: 0 }}>
     <Toolbar theme={theme}>
       {onClose ? <IconButton theme={theme} icon="ChevronLeft" label={t("coreAgentDetail.backToList")} onPress={onClose} /> : null}
@@ -300,6 +307,8 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
       return <Button key={action.key} theme={theme} label={action.label} icon={primary ? undefined : action.key === "archive" ? action.icon : undefined} variant={primary ? "primary" : action.key === "archive" ? "ghost" : "secondary"} grow={action.key !== "archive"} busy={action.busy} disabled={action.disabled} onPress={action.onPress} />;
     })}</BottomBar> : null}
     {actionMenu}
+    <SendToAgentSheet theme={theme} open={replying} onClose={() => setReplying(false)} agentId={agent.id} agentTitle={agent.title || t("coreAgentDetail.thisAgent")} finding={null} reply
+      onSent={() => { void queryCache.invalidateQueries({ queryKey: telemetryQueryKey(hostId) }); invalidateAttention(hostId); }} />
   </View>;
 }
 

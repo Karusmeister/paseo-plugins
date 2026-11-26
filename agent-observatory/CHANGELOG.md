@@ -2,6 +2,10 @@
 
 ## Unreleased (fork: security-hardening) · 2026-11-26
 
+**Type or dictate an answer to an agent awaiting a reply**
+- Under an awaiting agent's latest reply (Result tab), **Type or dictate an answer**, and **Type answer** among its actions (beside Answer at the bottom on phones), open a reply sheet: empty and focused, sent through the same ledger as quick replies and findings (one message id per reply, confirmation before interrupting a turn or an approval, send when the turn ends, schedule), listed under its own source, Your reply.
+- Dictation is the system's, which any text field takes: Fn (🌐) twice or Edit › Start Dictation on a Mac, the keyboard microphone on a phone; the sheet says so. Paseo's own voice input is not open to plugins, so for it the session is opened as before.
+
 **Mark an agent awaiting a reply as answered, and undo it**
 - An agent whose last reply asks you something (待回复 / Awaiting reply) has **Mark answered** in its details (in the ⋯ menu on phones): it leaves Awaiting reply without anything being sent to it. **Mark awaiting reply** in the ⋯ menu puts it back.
 - The mark names the reply you saw and covers only replies written before it: when the agent replies again and asks, it is awaiting a reply again. A mark on a reply that has since been replaced is refused (`stale`).

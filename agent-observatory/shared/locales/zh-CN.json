@@ -142,7 +142,9 @@
     "markAnsweredHint": "不需要回复：移出「待回复」。有新的回复时会重新出现",
     "markAwaitingReply": "标记为待回复",
     "markAwaitingReplyHint": "撤销「标记为已答复」：重新显示在「待回复」里",
-    "couldNotChangeAnswered": "无法更改答复状态，请稍后再试"
+    "couldNotChangeAnswered": "无法更改答复状态，请稍后再试",
+    "typeAnswer": "输入回复",
+    "thisAgent": "这个 Agent"
   },
   "coreAgentDigest": {
     "modelTimeShare": "{fraction} 的时间模型在思考和写回复。",
@@ -1092,7 +1094,8 @@
     "mayJustHaveBeenSent": "刚刚可能已经发出",
     "wasJustSent": "刚刚已经发出",
     "quotedItem": "「{item}」",
-    "quickReplySourceWithTitle": "快捷回复「{title}」"
+    "quickReplySourceWithTitle": "快捷回复「{title}」",
+    "replySource": "你的回复"
   },
   "coreInsightActions": {
     "highPriority": "高优先级",
@@ -1131,7 +1134,11 @@
     "mode": "模式 {value1}",
     "task": "任务",
     "start": "开始",
-    "profileName": "Profile {name}"
+    "profileName": "Profile {name}",
+    "replyToAgent": "回复「{title}」",
+    "yourAnswer": "你的回复",
+    "yourAnswerPlaceholder": "输入回复，或用听写口述",
+    "dictationHint": "口述：Mac 上连按两下 Fn（🌐），或用「编辑 › 开始听写」；手机上点键盘上的麦克风。要用 Paseo 自带的语音输入，请改为打开会话。"
   },
   "secondaryResultView": {
     "openInBrowser": "在浏览器打开",
@@ -1176,7 +1183,9 @@
     "answer": "去回答",
     "viewPlan": "查看计划",
     "review": "去处理",
-    "pendingRequest": "待处理请求"
+    "pendingRequest": "待处理请求",
+    "typeAnswer": "输入或口述回复",
+    "typeAnswerHint": "在这里回复这个 Agent：直接输入，或用系统听写口述"
   },
   "secondaryScheduleBoard": {
     "lastRuns": "最近 {count} 次：{value2}",
