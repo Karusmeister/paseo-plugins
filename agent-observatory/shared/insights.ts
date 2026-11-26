@@ -2,43 +2,35 @@ import { t } from "./text";
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
-/** The built-in Grok CLI runner's defaults: a saved `{ kind: "grok" }` (every choice before 2.12) runs with these. */
-export const GROK_DEFAULT_MODEL = "grok-4.7";
-export const GROK_DEFAULT_EFFORT = "xhigh";
-/** `--reasoning-effort` levels the Grok CLI offers, deepest first. */
-export const GROK_EFFORTS = ["xhigh", "high", "medium", "low"] as const;
-export type GrokEffort = (typeof GROK_EFFORTS)[number];
-/** A Grok CLI model id, passed to the CLI as one argument: letters, digits and `._:/-`, never starting with `-` (an option). */
-export const grokModelSchema = z.string().min(1).max(80).regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/, { error: () => t("sharedInsights.m001") });
-/** "Grok 4.7" for grok-<version> ids; any other id as written. */
-export function grokModelLabel(model: string): string { return /^grok-\d+(?:\.\d+)*$/.test(model) ? `Grok ${model.slice(5)}` : model; }
-/** "Grok 4.7 · xhigh" for the defaults. */
-export function grokRunnerLabel(runner: { model?: string; effort?: string }): string { return `${grokModelLabel(runner.model ?? GROK_DEFAULT_MODEL)} · ${runner.effort ?? GROK_DEFAULT_EFFORT}`; }
+/** The built-in choice: Claude Code with its default model, locked down like every analysis helper (server/insight-runner.ts). */
+export const CLAUDE_RUNNER = { kind: "provider", provider: "claude", model: null, thinkingOptionId: null } as const;
 
 /**
- * Who writes reports and suggestions. `auto` (the default) picks at run time: the Grok CLI when it is installed,
- * otherwise an enabled Paseo provider (Claude Code, then Codex, then providers that extend them) with its default model.
- * `grok` is the Grok CLI (tools disabled, empty temp directory) with an optional model and reasoning effort (grok-4.7 ·
- * xhigh when unset). `profile` / `provider` start a Paseo agent with that profile or provider/model as a sub-agent of
- * the analysed Agent (its workspace, a verified read-only or ask-first mode, approval requests denied), archived when done.
+ * Who writes reports, suggestions and recaps. `auto` (the default) picks at run time an enabled Paseo provider: Claude
+ * Code, then Codex, then providers that extend them, with its default model. `profile` / `provider` start a Paseo agent
+ * with that profile or provider/model. Every runner is a sub-agent of the analysed Agent (its workspace, a verified
+ * read-only mode with every tool denied, approval requests denied), archived when done.
+ * Earlier versions also had `grok`, the Grok CLI (which sent transcripts to xAI); this fork removed it, and a saved
+ * `{ kind: "grok", ... }` reads as `auto`.
  */
-export const insightRunnerSchema = z.discriminatedUnion("kind", [
+const runnerKinds = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("auto") }),
-  z.object({ kind: z.literal("grok"), model: grokModelSchema.optional(), effort: z.enum(GROK_EFFORTS).optional() }),
   z.object({ kind: z.literal("profile"), profileId: z.string().min(1).max(200) }),
   z.object({ kind: z.literal("provider"), provider: z.string().min(1).max(120), model: z.string().min(1).max(240).nullable(), thinkingOptionId: z.string().min(1).max(120).nullable() }),
 ]);
+const legacyGrok = (value: unknown) => value && typeof value === "object" && (value as { kind?: unknown }).kind === "grok" ? { kind: "auto" } : value;
+export const insightRunnerSchema = z.preprocess(legacyGrok, runnerKinds);
 /** What actually ran a job, resolved when it started (a profile can change later). */
 export const insightRunnerInfoSchema = z.object({
-  /** `auto` only while a queued job waits for its runner to be picked. */
+  /** `auto` only while a queued job waits for its runner to be picked. `grok` only in reports written by earlier versions. */
   kind: z.enum(["auto", "grok", "profile", "provider"]),
-  /** "Grok 4.7 · xhigh", the profile name, or "Claude Code · claude · Opus 5.5 · max". */
+  /** The profile name, or "Claude Code · claude · Opus 5.5 · max" ("Grok 4.7 · xhigh" in old reports). */
   label: z.string().max(160),
   provider: z.string().max(120).nullable(),
   model: z.string().max(240).nullable(),
   thinkingOptionId: z.string().max(120).nullable(),
   modeId: z.string().max(80).nullable(),
-  /** The Paseo analysis agent (archived when done), openable from the report; null for the built-in Grok CLI. */
+  /** The Paseo analysis agent (archived when done), openable from the report; null in reports the Grok CLI wrote. */
   sessionAgentId: z.string().max(256).nullable(),
 });
 export const insightSettingsSchema = z.object({
@@ -136,9 +128,9 @@ export const updateInsightSettings = defineRpc({
   name: "observatory.insights.configure", input: z.object({ autoEnabled: z.boolean().optional(), runner: insightRunnerSchema.optional() }), output: insightSettingsSchema,
 });
 /**
- * How a runner will analyse: `none` = tools disabled (built-in Grok CLI); `read` = a read-only mode (plan / ask / Codex's
- * read-only sandbox); `ask` = an ask-first mode without a read-only one (Claude Code's Always Ask): tool requests that
- * need approval are denied automatically, actions the provider allows without approval (reading files) may still run.
+ * How a runner will analyse: `read` = a read-only mode (Claude Code's plan mode with every tool denied, ask, plan, or
+ * Codex's read-only sandbox). `none` (tools disabled) and `ask` (an ask-first mode) are kept for older clients; this fork
+ * never offers `ask`, since pre-approved tools run there without a prompt.
  */
 export const RUNNER_ACCESS = ["none", "read", "ask"] as const;
 export const insightRunnerOptionSchema = z.object({
@@ -160,7 +152,7 @@ export const insightProviderOptionSchema = z.object({
   provider: z.string().max(120), label: z.string().max(160), available: z.boolean(), reason: z.string().max(300).nullable(),
   access: z.enum(RUNNER_ACCESS), modeId: z.string().max(80).nullable(), defaultModel: z.string().max(240).nullable(),
 });
-/** Automatic choice, the Grok CLI, the host's agent profiles (daemon config) and enabled providers, from cached daemon snapshots (no provider probes). */
+/** Automatic choice, Claude Code (`builtin`), the host's agent profiles (daemon config) and enabled providers, from cached daemon snapshots (no provider probes). */
 export const listInsightRunners = defineRpc({
   name: "observatory.insights.runners", input: z.object({}),
   output: z.object({ auto: insightRunnerOptionSchema, builtin: insightRunnerOptionSchema, profiles: z.array(insightRunnerOptionSchema).max(40), providers: z.array(insightProviderOptionSchema).max(40) }),

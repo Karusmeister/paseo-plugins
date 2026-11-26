@@ -5,6 +5,9 @@ import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RecapManager, registerRecaps, type RecapManagerOptions } from "../server/recap";
+import { AUTO_RUNNER_LABEL, NO_RUNNER_ERROR } from "../server/insight-runner";
+import { FAKE_CLAUDE_PLAN, fakePlan } from "./fake-claude";
+import type { InsightRunner } from "../shared/insights";
 import type { AgentTimelineItem, PaseoApi } from "../server/paseo-types";
 import { RECAP_DEFAULTS, recapSettings, type RecapSettings } from "../shared/recap";
 import { bindTranslator, createTranslator } from "../shared/i18n";
@@ -14,7 +17,7 @@ import kitZh from "../shared/locales/kit/zh-CN.json";
 import kitEn from "../shared/locales/kit/en.json";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 
-const ON: RecapSettings = { enabled: true, suggestions: true, runner: { kind: "grok" } };
+const ON: RecapSettings = { enabled: true, suggestions: true, runner: { kind: "auto" } };
 const T1 = "2026-10-15T01:00:00.000Z", T2 = "2026-10-15T01:05:00.000Z";
 const conversation: AgentTimelineItem[] = [{ type: "user_message", text: "把存储层拆出来" }, { type: "assistant_message", text: "已拆出 storage 包，测试通过。要我接着改调用方吗？" }];
 const answer = (summary = "拆分存储层：已拆出并通过测试", next: string | null = "改调用方", reply: string | null = "继续改调用方") => JSON.stringify({ structured_output: { summary, next, reply } });
@@ -26,23 +29,30 @@ async function until(check: () => boolean | Promise<boolean>, what: string, ms =
   assert.fail(`timed out waiting for ${what}`);
 }
 
-/** A manager over a scratch directory, a fake host (one snapshot per Agent) and a fake Grok CLI the test answers. */
-async function fixture(options: Partial<RecapManagerOptions> & { binary?: string | null } = {}) {
+/**
+ * A manager over a scratch directory, a fake host (one snapshot per Agent) and a fake helper the test answers: `auto`
+ * resolves to a locked-down Claude Code (tests/fake-claude.ts), or to nothing with `runner: false`. No helper cooldown
+ * unless a test sets one.
+ */
+async function fixture({ runner = true, ...options }: Partial<RecapManagerOptions> & { runner?: boolean } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "observatory-recap-"));
   const snapshots = new Map<string, Record<string, unknown>>();
   const snapshotOf = (id: string) => snapshots.get(id) ?? { id, status: "idle", archivedAt: null, labels: {}, pendingPermissions: [], cwd: "/work", workspaceId: "w1", title: `任务 ${id}` };
   const paseo = { agents: { ref: (id: string) => ({ refresh: async () => ({ agent: snapshotOf(id) }) }) } } as unknown as PaseoApi;
   const calls: Array<{ prompt: string; model?: string; effort?: string; settle: (output: string | Error) => void; signal: AbortSignal }> = [];
   let auto: string | Error | null = answer();
-  const runGrok: RecapManagerOptions["runGrok"] = input => new Promise<string>((resolve, reject) => {
-    const settle = (output: string | Error) => output instanceof Error ? reject(output) : resolve(output);
-    calls.push({ prompt: input.prompt, model: input.model, effort: input.effort, settle, signal: input.signal });
-    input.signal.addEventListener("abort", () => reject(new Error("canceled")), { once: true });
-    if (auto !== null) settle(auto);
-  });
+  const runPaseo = (async (input: { prompt: string; signal: AbortSignal; plan: typeof FAKE_CLAUDE_PLAN; parse: (text: string) => unknown }) => {
+    const text = await new Promise<string>((resolve, reject) => {
+      const settle = (output: string | Error) => output instanceof Error ? reject(output) : resolve(output);
+      calls.push({ prompt: input.prompt, model: input.plan.model, effort: input.plan.effort ?? undefined, settle, signal: input.signal });
+      input.signal.addEventListener("abort", () => reject(new Error("canceled")), { once: true });
+      if (auto !== null) settle(auto);
+    });
+    return { value: input.parse(text), usage: null, runner: { ...input.plan.info, sessionAgentId: "helper" } };
+  }) as unknown as RecapManagerOptions["runPaseo"];
+  const registry = () => ({ resolve: async (chosen: InsightRunner) => { if (!runner) throw new Error(NO_RUNNER_ERROR); return fakePlan(chosen); } });
   let turn: { startedAt: string | null; endedAt: string | null } | null = { startedAt: T1, endedAt: T2 };
-  const create = () => new RecapManager({ directory, quietMs: 20, findBinary: async () => options.binary === undefined ? "/fake/grok" : options.binary, runGrok,
-    observedTurn: async () => turn, ...options });
+  const create = () => new RecapManager({ directory, quietMs: 20, helperCooldownMs: 0, runPaseo, registry, observedTurn: async () => turn, ...options });
   const manager = create();
   return {
     directory, paseo, snapshots, calls, manager, create,
@@ -56,7 +66,9 @@ async function fixture(options: Partial<RecapManagerOptions> & { binary?: string
 
 test("off on a new install: a turn's end writes nothing, the list is empty and no file is created", async () => {
   assert.deepEqual(recapSettings.schema.parse({}), RECAP_DEFAULTS);
-  assert.deepEqual(RECAP_DEFAULTS, { enabled: false, suggestions: false, runner: { kind: "grok" } });
+  assert.deepEqual(RECAP_DEFAULTS, { enabled: false, suggestions: false, runner: { kind: "auto" } });
+  // A Grok runner saved by an earlier version reads as automatic.
+  assert.deepEqual(recapSettings.schema.parse({ runner: { kind: "grok", effort: "low" } }).runner, { kind: "auto" });
   const f = await fixture();
   try {
     await f.manager.configure(RECAP_DEFAULTS);
@@ -78,12 +90,12 @@ test("a top-level Agent's normal turn gets one recap after the quiet time, at lo
     assert.equal((await f.list()).recaps[0]?.state, "pending", "更新中 from the turn's end");
     await until(() => f.calls.length === 1, "the run");
     assert.equal((await f.list()).recaps[0]?.state, "generating");
-    assert.deepEqual([f.calls[0]!.model, f.calls[0]!.effort], ["grok-4.7", "low"]);
+    assert.deepEqual([f.calls[0]!.model, f.calls[0]!.effort], [FAKE_CLAUDE_PLAN.model, FAKE_CLAUDE_PLAN.effort]);
     assert.ok(f.calls[0]!.prompt.includes("User: 把存储层拆出来"));
     f.calls[0]!.settle(answer());
     await until(async () => (await f.list()).recaps[0]?.state === "idle", "the recap");
     const [recap] = (await f.list()).recaps;
-    assert.deepEqual({ ...recap, at: null }, { agentId: "a", summary: "拆分存储层：已拆出并通过测试", next: "改调用方", reply: "继续改调用方", at: null, roundAt: T1, endedAt: T2, stale: false, state: "idle", runner: "Grok 4.7 · low" });
+    assert.deepEqual({ ...recap, at: null }, { agentId: "a", summary: "拆分存储层：已拆出并通过测试", next: "改调用方", reply: "继续改调用方", at: null, roundAt: T1, endedAt: T2, stale: false, state: "idle", runner: FAKE_CLAUDE_PLAN.info.label });
     // An unchanged list costs a few bytes.
     const again = await f.manager.list((await f.list()).revision);
     assert.equal(again.mode, "unchanged");
@@ -181,8 +193,8 @@ test("a failure is not retried for that turn and pauses new recaps with a growin
   } finally { await f.close(); }
 });
 
-test("without the Grok CLI recaps wait quietly and the settings say why", async () => {
-  const f = await fixture({ binary: null });
+test("without a usable runner recaps wait quietly and the settings say why", async () => {
+  const f = await fixture({ runner: false });
   try {
     await f.manager.configure(ON);
     f.end("a");
@@ -190,7 +202,7 @@ test("without the Grok CLI recaps wait quietly and the settings say why", async 
     assert.equal(f.calls.length, 0);
     assert.deepEqual((await f.list()).recaps, []);
     const status = await f.manager.status(f.paseo);
-    assert.deepEqual([status.available, status.problem, status.runner], [false, "grok", "Grok 4.7 · low"]);
+    assert.deepEqual([status.available, status.problem, status.runner], [false, "runner", AUTO_RUNNER_LABEL]); assert.equal(status.reason, NO_RUNNER_ERROR);
   } finally { await f.close(); }
 });
 
@@ -209,11 +221,11 @@ test("a profile or provider runs as the analyses' temporary sub-agent of the Age
     await until(async () => (await f.list()).recaps[0]?.summary === "用 Profile 写的小结", "the recap");
     assert.deepEqual(runs, [{ parent: { id: "a", cwd: "/work", workspaceId: "w1", archived: false, title: "任务 a" }, title: "小结 · 任务 a" }]);
     assert.equal((await f.list()).recaps[0]!.runner, "Fast Profile");
-    assert.equal(f.calls.length, 0, "the Grok CLI is not used");
+    assert.equal(f.calls.length, 0, "the default helper is not used");
   } finally { await f.close(); }
 });
 
-test("a profile or another model writes an Agent's recap at most once per cooldown, for its latest turn; the Grok CLI waits for nothing (A3)", async () => {
+test("a recap helper runs at most once per cooldown per Agent, for its latest turn, whichever runner writes it (A3)", async () => {
   const runs: Array<{ prompt: string; at: number }> = [];
   const f = await fixture({
     helperCooldownMs: 600,
@@ -242,13 +254,14 @@ test("a profile or another model writes an Agent's recap at most once per cooldo
     await until(async () => (await f.list()).recaps[0]?.summary === "第 2 份小结", "the second recap");
     await wait(700);
     assert.equal(runs.length, 2, "nothing more without a new turn");
-    // The Grok CLI leaves no sub-agent: every turn gets its recap.
+    // The automatic runner also leaves a sub-agent behind, so it waits out the same cooldown: one run once it is over,
+    // then nothing for a turn that ends right after.
     await f.manager.configure(ON);
-    for (const [index, text] of ["第四轮", "第五轮"].entries()) {
-      f.manager.turnStarted("a"); f.end("a", turn(text));
-      await until(() => f.calls.length === index + 1, `the Grok run for ${text}`, 1000);
-    }
-    assert.equal(runs.length, 2);
+    f.manager.turnStarted("a"); f.end("a", turn("第四轮"));
+    await until(() => runs.length === 3, "the automatic run after the cooldown", 1000);
+    f.manager.turnStarted("a"); f.end("a", turn("第五轮"));
+    await wait(150);
+    assert.equal(runs.length, 3, "the automatic runner waits out the cooldown too");
   } finally { await f.close(); }
 });
 
@@ -334,14 +347,14 @@ test("turning recaps off deletes the file and every copy of it, even when every 
   try {
     // Only expired recaps: memory holds nothing once loaded, the file still holds them.
     await writeFile(file, JSON.stringify({ version: 1, recaps: [stored("a", now - 45 * DAY)] }), { mode: 0o600 });
-    const expired = new RecapManager({ directory, findBinary: async () => null });
+    const expired = new RecapManager({ directory });
     await expired.configure({ ...ON, enabled: false });
     await expired.close();
     assert.deepEqual(await readdir(directory), []);
     // A damaged file set aside as the backup, and the temporary file of a write a crash cut short.
     await writeFile(file, JSON.stringify({ version: 1, recaps: [stored("b", now - DAY)] }) + "broken", { mode: 0o600 });
     await writeFile(join(directory, `recaps.json.${randomUUID()}.tmp`), JSON.stringify({ version: 1, recaps: [stored("c", now)] }), { mode: 0o600 });
-    const damaged = new RecapManager({ directory, findBinary: async () => null });
+    const damaged = new RecapManager({ directory });
     await damaged.ready;
     assert.deepEqual((await readdir(directory)).filter(name => name.endsWith(".backup")), ["recaps.json.backup"]);
     await damaged.configure({ ...ON, enabled: false });
@@ -357,13 +370,13 @@ test("recaps dropped when the file loads leave the disk at once; a file with not
   try {
     await writeFile(file, JSON.stringify({ version: 1, recaps: [stored("fresh", now - DAY), stored("old", now - 31 * DAY), { agentId: "damaged" }] }), { mode: 0o600 });
     // The setting unread (recaps paused, nothing forgotten): the load alone rewrites the file.
-    const manager = new RecapManager({ directory, findBinary: async () => null });
+    const manager = new RecapManager({ directory });
     await until(async () => JSON.parse(await readFile(file, "utf8")).recaps.length === 1, "the file rewritten without the dropped recaps");
     assert.deepEqual(JSON.parse(await readFile(file, "utf8")).recaps.map((recap: { agentId: string }) => recap.agentId), ["fresh"]);
     assert.equal((await readFile(file, "utf8")).includes("PRIVATE SUMMARY old"), false);
     await manager.close();
     const before = await stat(file);
-    const again = new RecapManager({ directory, findBinary: async () => null });
+    const again = new RecapManager({ directory });
     await again.ready;
     await again.close();
     assert.equal((await stat(file)).ino, before.ino, "not rewritten");
@@ -378,7 +391,7 @@ test("a set-aside copy or a cut-short write older than 30 days goes when the sto
     const old = new Date(Date.now() - 31 * DAY);
     for (const path of [backup, oldTemp]) await utimes(path, old, old);
     await writeFile(join(directory, "other.json"), "{}", { mode: 0o600 });
-    const manager = new RecapManager({ directory, findBinary: async () => null });
+    const manager = new RecapManager({ directory });
     await manager.configure(ON);
     assert.deepEqual((await readdir(directory)).sort(), [newTemp.slice(directory.length + 1), "other.json"].sort());
     await writeFile(backup, "PRIVATE SUMMARY", { mode: 0o600 });
@@ -390,7 +403,7 @@ test("a set-aside copy or a cut-short write older than 30 days goes when the sto
 
 test("turning recaps off cancels a run under way; the setting reaches the manager through the host's settings", async () => {
   const handlers = new Map<string, (input: unknown, context: unknown) => unknown>(), listeners = new Set<(state: unknown) => void>(), hooks = new Map<string, (input: unknown, context: unknown) => unknown>();
-  let values: unknown = { enabled: true, suggestions: true, runner: { kind: "grok" } };
+  let values: unknown = { enabled: true, suggestions: true, runner: { kind: "auto" } };
   const host = {
     registerSettings: (definition: { id: string }) => { assert.equal(definition.id, "recap"); return { read: async () => ({ status: "ready", revision: "1", values }), subscribe(listener: (state: unknown) => void) { listeners.add(listener); return () => listeners.delete(listener); } }; },
     handle: (contract: { name: string }, handler: (input: unknown, context: unknown) => unknown) => { handlers.set(contract.name, handler); },
@@ -400,7 +413,8 @@ test("turning recaps off cancels a run under way; the setting reaches the manage
   await f.manager.close();
   f.answerWith(null);
   const runs: AbortSignal[] = [];
-  const registered = registerRecaps(host, { directory: f.directory, quietMs: 20, findBinary: async () => "/fake/grok", runGrok: input => { runs.push(input.signal); return new Promise((_resolve, reject) => input.signal.addEventListener("abort", () => reject(new Error("canceled")))); } });
+  const registered = registerRecaps(host, { directory: f.directory, quietMs: 20, registry: () => ({ resolve: async (runner: InsightRunner) => fakePlan(runner) }),
+    runPaseo: ((input: { signal: AbortSignal }) => { runs.push(input.signal); return new Promise((_resolve, reject) => input.signal.addEventListener("abort", () => reject(new Error("canceled")))); }) as unknown as RecapManagerOptions["runPaseo"] });
   try {
     assert.deepEqual([...handlers.keys()].sort(), ["observatory.recap.list", "observatory.recap.status"]);
     await until(async () => ((await handlers.get("observatory.recap.list")!({}, {})) as { enabled?: boolean }).enabled === true, "the setting read");

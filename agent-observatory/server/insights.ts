@@ -2,17 +2,17 @@ import { t } from "../shared/text";
 import { createHash, randomUUID } from "node:crypto";
 import type { PaseoApi } from "./paseo-types";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { cancelInsight, getInsightState, getInsightReport, grokModelLabel, grokRunnerLabel, listInsightJobs, listInsightRunners, listInsightModels, insightReportSchema, setFindingFeedback, startInsight, updateInsightSettings,
+import { cancelInsight, getInsightState, getInsightReport, listInsightJobs, listInsightRunners, listInsightModels, insightReportSchema, setFindingFeedback, startInsight, updateInsightSettings,
   type FindingFeedback, type InsightJob, type InsightListState, type InsightSettings, type InsightRunner } from "../shared/insights";
 import type { SessionTrajectory, TrajectoryRow } from "../shared/trajectory";
-import { assessTrajectory, buildAnalysisRequest, InsightReportError, isUsefulInsightReport, parseGrokReport, redactSecrets, trajectoryFingerprint } from "./insight-analysis";
+import { assessTrajectory, buildAnalysisRequest, isUsefulInsightReport, parseInsightText, redactSecrets, trajectoryFingerprint } from "./insight-analysis";
 import { excerptText } from "../shared/evidence";
-import { ANALYSIS_SYSTEM_PROMPT, findGrokBinary, GrokTurnLimitError, runGrokAnalysis } from "./grok-runner";
+import { ANALYSIS_SYSTEM_PROMPT } from "./analysis-prompt";
 import { abortable, fetchTrajectory } from "./trajectory";
 import { telemetryDirectory } from "./telemetry";
 import { fitInsightReport, InsightStorage, retainInsightJobs, summarizeInsight, type InsightActivity, type InsightCooldown } from "./insight-storage";
 
-import { AUTO_RUNNER_LABEL, BUILTIN_INSIGHT_RUNNER, InsightRunnerRegistry, NO_RUNNER_ERROR, cleanupInsightAgents, grokPlan, runPaseoStructured } from "./insight-runner";
+import { AUTO_RUNNER_LABEL, InsightRunnerRegistry, NO_RUNNER_ERROR, PENDING_RUNNER_INFO, cleanupInsightAgents, runPaseoStructured } from "./insight-runner";
 import { isInsightAgent, isKnownInsightAgent, markInsightAgent } from "./insight-runner-lifecycle";
 import { turnRead } from "./lifecycle-hub";
 import { hookTimeline, isTurnStart, turnTimeline } from "./turn-timeline";
@@ -29,7 +29,9 @@ type ReportQueueEntry = { kind: "report"; id: string; paseo: PaseoApi; question?
 type SuggestionQueueEntry = { kind: "suggestion"; id: string; paseo: PaseoApi; runner?: InsightRunner; clock: SuggestionClock | null };
 type QueueEntry = ReportQueueEntry | SuggestionQueueEntry;
 export interface InsightManagerOptions {
-  directory?: string; now?: () => number; findBinary?: typeof findGrokBinary; run?: typeof runGrokAnalysis; fetch?: typeof fetchTrajectory;
+  directory?: string; now?: () => number; fetch?: typeof fetchTrajectory;
+  /** Seams for tests: the runner registry per daemon connection and the helper run (default runPaseoStructured). */
+  registry?: (paseo: PaseoApi) => InsightRunnerRegistry; runPaseo?: typeof runPaseoStructured;
   /**
    * The zone a client reported last (DeviceZone.device()), for suggestion windows queued without a client's clock:
    * automatic suggestions in the background (grok-F3). Null or absent: UTC days, which the job then says.
@@ -52,24 +54,23 @@ export class InsightManager {
   private readonly autoDue = new Map<string, number>();
   private readonly storage: InsightStorage;
   private readonly now: () => number;
-  private readonly run: typeof runGrokAnalysis;
   private readonly fetch: typeof fetchTrajectory;
-  private readonly findBinary: typeof findGrokBinary;
+  private readonly runPaseo: typeof runPaseoStructured;
+  private readonly makeRegistry: (paseo: PaseoApi) => InsightRunnerRegistry;
   private readonly zone: () => string | null;
-  private binary: string | null = null;
   private ready: Promise<void>;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private saveLazy = false;
   private processing: Promise<void> | null = null;
   private current: { id: string; abort: AbortController } | null = null;
-  private readonly executions = new Set<Promise<unknown>>();
   private closed = false;
   private initialized = false;
   private deferredLifecycle: Array<{ id: string; started: boolean }> = [];
   constructor(options: InsightManagerOptions = {}) {
     this.storage = new InsightStorage(options.directory ?? telemetryDirectory());
     this.suggestionStorage = new SuggestionStorage(options.directory ?? telemetryDirectory()); this.now = options.now ?? Date.now;
-    this.run = options.run ?? runGrokAnalysis; this.fetch = options.fetch ?? fetchTrajectory; this.findBinary = options.findBinary ?? findGrokBinary;
+    this.fetch = options.fetch ?? fetchTrajectory; this.runPaseo = options.runPaseo ?? runPaseoStructured;
+    this.makeRegistry = options.registry ?? (paseo => new InsightRunnerRegistry(paseo, { now: this.now }));
     this.zone = options.zone ?? (() => null);
     this.ready = this.initialize();
   }
@@ -80,7 +81,7 @@ export class InsightManager {
       ? { ...job, status: "canceled", stage: t("serverInsights.m001"), updatedAt: this.iso() } : job);
     this.jobs = retainInsightJobs(data.jobs.map(job => ACTIVE.has(job.status) ? { ...job, status: "canceled", stage: t("serverInsights.m002"), updatedAt: this.iso() }
       : job.status === "completed" && !isUsefulInsightReport(job.report) ? { ...job, status: "failed", stage: t("serverInsights.m003"), error: t("serverInsights.m004"), updatedAt: this.iso() } : job));
-    await this.refreshBinary(); this.initialized = true;
+    this.initialized = true;
     for (const event of this.deferredLifecycle) event.started ? this.turnStarted(event.id) : this.turnEnded(event.id);
     this.deferredLifecycle = []; await this.persist();
   }
@@ -95,16 +96,10 @@ export class InsightManager {
   }
   private registry(paseo: PaseoApi) {
     let registry = this.registries.get(paseo);
-    if (!registry) { registry = new InsightRunnerRegistry(paseo, { now: this.now, findBinary: this.findBinary }); this.registries.set(paseo, registry); }
+    if (!registry) { registry = this.makeRegistry(paseo); this.registries.set(paseo, registry); }
     return registry;
   }
-  /** The built-in Grok option carries the saved model and effort when it is the configured runner, so picking it keeps them. */
-  async runners(paseo: PaseoApi) {
-    await this.ready; this.attach(paseo);
-    const runners = await this.registry(paseo).runners(), saved = this.settings.runner;
-    if (saved.kind === "grok") { const plan = grokPlan(saved); runners.builtin = { ...runners.builtin, runner: structuredClone(saved), label: plan.info.label, modelLabel: grokModelLabel(plan.model), thinkingLabel: plan.effort }; }
-    return runners;
-  }
+  async runners(paseo: PaseoApi) { await this.ready; this.attach(paseo); return this.registry(paseo).runners(); }
   async models(paseo: PaseoApi, provider: string) { await this.ready; this.attach(paseo); return this.registry(paseo).models(provider); }
   /** 总览 in the client's clock: its offset, and its IANA zone when it knows one (grok-F3). */
   async overview(paseo: PaseoApi, days: OverviewDays, utcOffsetMinutes: number, revision?: string, timeZone?: string) {
@@ -119,21 +114,17 @@ export class InsightManager {
     return device ? { timeZone: device } : null;
   }
   private async available() {
-    // `auto` never runs the Grok CLI (insight-runner.ts AUTO_BASES): it resolves to Codex or a locked-down Claude Code.
-    if (this.settings.runner.kind === "grok") return !!this.binary;
     if (!this.lastPaseo) return false;
     try { await this.registry(this.lastPaseo).resolve(this.settings.runner); return true; } catch { return false; }
   }
   private async runnerLabel(paseo = this.lastPaseo) {
     const runner = this.settings.runner;
-    if (runner.kind === "grok") return grokRunnerLabel(runner);
     try {
       if (paseo) { const label = (await this.registry(paseo).resolve(runner)).info.label; return (runner.kind === "auto" ? `${AUTO_RUNNER_LABEL} · ${label}` : label).slice(0, 160); }
     } catch { /* preserve the configured identity when unavailable */ }
     if (runner.kind === "auto") return t("serverInsights.m006", { AUTO_RUNNER_LABEL: AUTO_RUNNER_LABEL });
     return (runner.kind === "profile" ? t("serverInsights.m007", { value1: runner.profileId.slice(0, 140) }) : t("serverInsights.m008", { value1: runner.provider.slice(0, 140) })).slice(0, 160);
   }
-  private async refreshBinary() { const binary = await this.findBinary().catch(() => null); if (binary !== this.binary) { this.binary = binary; this.revision++; } }
   private iso() { return new Date(this.now()).toISOString(); }
   /** Job changes persist promptly; turn-activity counters only feed freshness hints and are saved lazily. */
   private changed(lazy = false) {
@@ -170,7 +161,7 @@ export class InsightManager {
     return structuredClone({ settings: this.settings, jobs: this.jobs.filter(job => !agentId || job.agentId === agentId).map(job => this.decorate(job)), persistenceError: this.storage.error ?? this.suggestionStorage.error, available: await this.available() });
   }
   async list(agentId?: string, revision?: number): Promise<InsightListState> {
-    await this.ready; await this.refreshBinary();
+    await this.ready;
     const relevant = this.jobs.filter(job => !agentId || job.agentId === agentId);
     const due = [...this.autoDue].filter(([id]) => !agentId || id === agentId);
     const content = { settings: this.settings, runnerLabel: await this.runnerLabel(), jobs: relevant.map(job => summarizeInsight(this.decorate(job))), persistenceError: this.storage.error ?? this.suggestionStorage.error, available: await this.available(),
@@ -203,12 +194,12 @@ export class InsightManager {
   }
   private newJob(agentId: string, trigger: "manual" | "auto", selection?: InsightRunner): InsightJob {
     const at = this.iso();
-    // Until the runner is resolved, a queued job names the chosen kind instead of looking like a Grok run.
-    const pending = selection && selection.kind !== "grok" ? { runner: { ...BUILTIN_INSIGHT_RUNNER, kind: selection.kind, model: null, thinkingOptionId: null,
+    // Until the runner is resolved, a queued job names the chosen kind; model and effort are filled in when it starts.
+    const pending = selection ? { runner: { ...PENDING_RUNNER_INFO, kind: selection.kind, model: null, thinkingOptionId: null,
       label: selection.kind === "auto" ? AUTO_RUNNER_LABEL : t("serverInsights.m010"), provider: selection.kind === "provider" ? selection.provider : null } } : {};
     return { id: randomUUID(), agentId, agentTitle: this.jobs.find(job => job.agentId === agentId)?.agentTitle ?? t("serverInsights.m011"),
       projectName: this.jobs.find(job => job.agentId === agentId)?.projectName ?? t("serverInsights.m012"), createdAt: at, updatedAt: at, status: "queued", trigger,
-      stage: t("serverInsights.m013"), eligibility: null, coverage: null, report: null, model: "grok-4.7", effort: "xhigh", usage: null, error: null, ...pending };
+      stage: t("serverInsights.m013"), eligibility: null, coverage: null, report: null, model: "pending", effort: null, usage: null, error: null, ...pending };
   }
   async start(paseo: PaseoApi, agentId: string, trigger: "manual" | "auto" = "manual", question?: string, mode: "full" | "incremental" = "incremental", runner?: InsightRunner): Promise<InsightJob> {
     await this.ready;
@@ -228,13 +219,12 @@ export class InsightManager {
       if (last && this.now() < Date.parse(last.analyzedAt) + this.settings.cooldownHours * 3600000)
         return this.skip(agentId, t("serverInsights.m017", { value1: new Date(Date.parse(last.analyzedAt) + this.settings.cooldownHours * 3600000).toISOString() }));
     }
-    await this.refreshBinary();
+    const selection = runner ?? this.settings.runner;
+    if (selection.kind === "auto") await this.registry(paseo).resolve(selection).catch(error => { throw error instanceof Error && error.message === NO_RUNNER_ERROR ? error : new Error(t("serverInsights.m021", { NO_RUNNER_ERROR: NO_RUNNER_ERROR, value2: error instanceof Error ? error.message : String(error) })); });
+    // Checked again after the wait above: a close, automation switched off, or another start may have happened meanwhile.
     if (this.closed) throw new Error(t("serverInsights.m018"));
     if (trigger === "auto" && !this.settings.autoEnabled) throw new Error(t("serverInsights.m019"));
     if (this.jobs.some(job => job.agentId === agentId && ACTIVE.has(job.status))) return this.start(paseo, agentId, trigger, question, mode, runner);
-    const selection = runner ?? this.settings.runner;
-    if (selection.kind === "grok" && !this.binary) throw new Error(t("serverInsights.m020"));
-    if (selection.kind === "auto") await this.registry(paseo).resolve(selection).catch(error => { throw error instanceof Error && error.message === NO_RUNNER_ERROR ? error : new Error(t("serverInsights.m021", { NO_RUNNER_ERROR: NO_RUNNER_ERROR, value2: error instanceof Error ? error.message : String(error) })); });
     if (this.queue.length >= 8) throw new Error(t("serverInsights.m022"));
     const job = this.newJob(agentId, trigger, selection); this.jobs.unshift(job); this.enqueue({ kind: "report", id: job.id, paseo, question, mode, runner }, trigger); this.changed(); this.kick();
     return structuredClone(job);
@@ -288,31 +278,15 @@ export class InsightManager {
         this.update(job.id, { source, reviewContext: { mode: sameEpoch ? "incremental" : "full", baseJobId: sameEpoch ? prior!.id : null,
           newRows: trajectory.rows.length, unresolvedFindings: unresolved.length }, status: "analyzing", stage: sameEpoch ? t("serverInsights.m029") : t("serverInsights.m030", { value1: plan.info.label }) });
         const context = { previousReview: sameEpoch && prior ? { jobId: prior.id, summary: prior.report!.summary, findings: unresolved } : undefined, historicalEvidence };
-        let request = buildAnalysisRequest(trajectory, entry.question, context);
-        let parsed: ReturnType<typeof parseGrokReport> | null = null, priorUsage: InsightJob["usage"] = null; let retried = false;
-        if (plan.info.kind !== "grok") {
-          const result = await runPaseoStructured<ReturnType<typeof parseGrokReport>>({ paseo: entry.paseo, plan,
-            parent: { id: job.agentId, cwd: trajectory.agent.cwd ?? "", workspaceId: trajectory.agent.workspaceId, archived: !!trajectory.agent.archivedAt, title: trajectory.agent.title },
-            jobId: job.id, prompt: request.prompt, systemPrompt: ANALYSIS_SYSTEM_PROMPT, schema: insightReportSchema,
-            parse: text => parseGrokReport(text, request.references), signal: abort.signal, now: this.now,
-            onSession: runner => { markInsightAgent(runner.sessionAgentId!); this.update(job.id, { runner }); },
-            onRetry: () => this.update(job.id, { stage: t("serverInsights.m031") }) });
-          parsed = { ...result.value, usage: result.usage };
-        } else for (let attempt = 0; attempt < 2; attempt++) {
-          if (abort.signal.aborted || this.closed) break;
-          if (!this.binary) await this.refreshBinary();
-          if (!this.binary) throw new Error(t("serverInsights.m032"));
-          const execution = this.run({ binary: this.binary, prompt: request.prompt, signal: abort.signal, model: plan.model, effort: plan.effort ?? undefined });
-          this.executions.add(execution); void execution.then(() => this.executions.delete(execution), () => this.executions.delete(execution));
-          // A Grok turn limit (GrokTurnLimitError) is an InsightReportError too: it gets the same one compact retry (opus-F72).
-          try { const output = await abortable(execution, abort.signal); if (abort.signal.aborted || this.closed) break; parsed = parseGrokReport(output, request.references); break; }
-          catch (error) { if (abort.signal.aborted || this.closed || !(error instanceof InsightReportError) || attempt > 0) throw error; priorUsage = error.usage; retried = true;
-            this.update(job.id, { stage: error instanceof GrokTurnLimitError ? t("serverInsights.m033") : t("serverInsights.m034") });
-            request = buildAnalysisRequest(trajectory, entry.question, { ...context, compact: true }); }
-        }
-        if (abort.signal.aborted || this.closed) continue; if (!parsed) throw new Error(t("serverInsights.m035"));
-        if (retried) { const sum = (a: number | null | undefined, b: number | null | undefined) => a == null || b == null ? null : a + b;
-          parsed.usage = { inputTokens: sum(priorUsage?.inputTokens, parsed.usage?.inputTokens), outputTokens: sum(priorUsage?.outputTokens, parsed.usage?.outputTokens), costUsd: sum(priorUsage?.costUsd, parsed.usage?.costUsd) }; }
+        const request = buildAnalysisRequest(trajectory, entry.question, context);
+        const result = await this.runPaseo<ReturnType<typeof parseInsightText>>({ paseo: entry.paseo, plan,
+          parent: { id: job.agentId, cwd: trajectory.agent.cwd ?? "", workspaceId: trajectory.agent.workspaceId, archived: !!trajectory.agent.archivedAt, title: trajectory.agent.title },
+          jobId: job.id, prompt: request.prompt, systemPrompt: ANALYSIS_SYSTEM_PROMPT, schema: insightReportSchema,
+          parse: text => parseInsightText(text, request.references), signal: abort.signal, now: this.now,
+          onSession: runner => { markInsightAgent(runner.sessionAgentId!); this.update(job.id, { runner }); },
+          onRetry: () => this.update(job.id, { stage: t("serverInsights.m031") }) });
+        if (abort.signal.aborted || this.closed) continue;
+        const parsed = { ...result.value, usage: result.usage };
         if (!trajectory.coverage.complete || request.sampled) { parsed.report.limitations = [...parsed.report.limitations.slice(0, 7), t("serverInsights.m036", { value1: request.evidence.length })]; if (parsed.report.confidence === "high") parsed.report.confidence = "medium"; }
         const cited = new Set(parsed.report.findings.flatMap(finding => finding.evidence));
         const evidence = request.evidence.filter(row => cited.has(row.ref)).slice(0, 80).map(row => ({ ref: row.ref, at: row.at, kind: row.kind.slice(0, 100), toolName: row.toolName?.slice(0, 200) ?? null, text: excerptText(row.text, 2000).text }));
@@ -356,7 +330,7 @@ export class InsightManager {
     const at = this.iso(), selection = runner ?? this.settings.runner, resolved = this.clockFor(clock);
     const job: SuggestionJob = { id: randomUUID(), createdAt: at, updatedAt: at, status: "queued", trigger, stage: t("serverInsights.m044"),
       window: { days, from: at, to: at, reports: 0, findings: 0, agents: 0, ...windowClock(suggestionZone(resolved, this.now()), this.now()) },
-      runner: selection.kind === "grok" ? grokPlan(selection).info : { ...BUILTIN_INSIGHT_RUNNER, kind: selection.kind, label: selection.kind === "auto" ? AUTO_RUNNER_LABEL : t("serverInsights.m045"),
+      runner: { ...PENDING_RUNNER_INFO, kind: selection.kind, label: selection.kind === "auto" ? AUTO_RUNNER_LABEL : t("serverInsights.m045"),
         provider: selection.kind === "provider" ? selection.provider : null, model: null, thinkingOptionId: null },
       usage: null, error: null, report: null, basis: [] };
     this.suggestionJobs.unshift(job); this.enqueue({ kind: "suggestion", id: job.id, paseo, runner, clock: resolved }, trigger); this.changed(); this.kick();
@@ -374,40 +348,18 @@ export class InsightManager {
       if (this.cleanup) await abortable(this.cleanup, abort.signal);
       const plan = await abortable(this.registry(entry.paseo).resolve(selection), abort.signal);
       this.updateSuggestion(job.id, { runner: plan.info, status: "analyzing", stage: t("serverInsights.m047", { value1: plan.info.label }) });
-      let parsed: ReturnType<typeof parseSuggestionText>;
-      if (plan.info.kind !== "grok") {
-        const source = context.parentJob!;
-        let parent;
-        try { parent = (await abortable(entry.paseo.agents.ref(source.agentId).refresh(), abort.signal))?.agent; }
-        catch (error) { if (abort.signal.aborted) throw error; throw new Error(t("serverInsights.m048")); }
-        if (!parent) throw new Error(t("serverInsights.m049"));
-        const result = await runPaseoStructured<ReturnType<typeof parseSuggestionText>>({ paseo: entry.paseo, plan,
-          parent: { id: source.agentId, cwd: parent.cwd, workspaceId: parent.workspaceId ?? null, archived: !!parent.archivedAt, title: parent.title ?? source.agentTitle },
-          jobId: job.id, title: t("serverInsights.m050", { value1: job.window.days }), prompt: buildSuggestionPrompt(context),
-          systemPrompt: SUGGESTION_SYSTEM_PROMPT, schema: suggestionReportSchema, parse: text => parseSuggestionText(text, context.references),
-          signal: abort.signal, now: this.now, onSession: runner => { markInsightAgent(runner.sessionAgentId!); this.updateSuggestion(job.id, { runner }); },
-          onRetry: () => this.updateSuggestion(job.id, { stage: t("serverInsights.m051") }) });
-        parsed = { ...result.value, usage: result.usage };
-      } else {
-        await this.refreshBinary(); if (!this.binary) throw new Error(t("serverInsights.m052"));
-        let result: ReturnType<typeof parseSuggestionText> | null = null, priorUsage: InsightJob["usage"] = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          if (abort.signal.aborted || this.closed) return;
-          const execution = this.run({ binary: this.binary, prompt: buildSuggestionPrompt(context, { compact: attempt > 0 }),
-            signal: abort.signal, schema: suggestionReportSchema, systemPrompt: SUGGESTION_SYSTEM_PROMPT, model: plan.model, effort: plan.effort ?? undefined });
-          this.executions.add(execution); void execution.then(() => this.executions.delete(execution), () => this.executions.delete(execution));
-          // The run's own failure (a Grok turn limit) is inside the try, so it gets the one compact retry too (opus-F72).
-          try { result = parseSuggestionText(await abortable(execution, abort.signal), context.references); }
-          catch (error) { if (abort.signal.aborted || this.closed || !(error instanceof InsightReportError) || attempt) throw error; priorUsage = error.usage;
-            this.updateSuggestion(job.id, { stage: error instanceof GrokTurnLimitError ? t("serverInsights.m053") : t("serverInsights.m054") }); continue; }
-          if (attempt) {
-            const sum = (a: number | null | undefined, b: number | null | undefined) => a == null || b == null ? null : a + b;
-            result.usage = { inputTokens: sum(priorUsage?.inputTokens, result.usage?.inputTokens), outputTokens: sum(priorUsage?.outputTokens, result.usage?.outputTokens), costUsd: sum(priorUsage?.costUsd, result.usage?.costUsd) };
-          }
-          break;
-        }
-        if (!result) throw new Error(t("serverInsights.m055")); parsed = result;
-      }
+      const source = context.parentJob!;
+      let parent;
+      try { parent = (await abortable(entry.paseo.agents.ref(source.agentId).refresh(), abort.signal))?.agent; }
+      catch (error) { if (abort.signal.aborted) throw error; throw new Error(t("serverInsights.m048")); }
+      if (!parent) throw new Error(t("serverInsights.m049"));
+      const result = await this.runPaseo<ReturnType<typeof parseSuggestionText>>({ paseo: entry.paseo, plan,
+        parent: { id: source.agentId, cwd: parent.cwd, workspaceId: parent.workspaceId ?? null, archived: !!parent.archivedAt, title: parent.title ?? source.agentTitle },
+        jobId: job.id, title: t("serverInsights.m050", { value1: job.window.days }), prompt: buildSuggestionPrompt(context),
+        systemPrompt: SUGGESTION_SYSTEM_PROMPT, schema: suggestionReportSchema, parse: text => parseSuggestionText(text, context.references),
+        signal: abort.signal, now: this.now, onSession: runner => { markInsightAgent(runner.sessionAgentId!); this.updateSuggestion(job.id, { runner }); },
+        onRetry: () => this.updateSuggestion(job.id, { stage: t("serverInsights.m051") }) });
+      const parsed = { ...result.value, usage: result.usage };
       if (abort.signal.aborted || this.closed) return;
       this.updateSuggestion(job.id, { status: "completed", stage: t("serverInsights.m056"), report: parsed.report, evidence: parsed.evidence, usage: parsed.usage, error: null });
     } catch (error) {
@@ -458,11 +410,6 @@ export class InsightManager {
     this.suggestionJobs = this.suggestionJobs.map(job => ACTIVE.has(job.status) ? { ...job, status: "canceled", stage: t("serverInsights.m065"), updatedAt: this.iso() } : job);
     this.queue = []; this.current?.abort.abort(); if (this.saveTimer) clearTimeout(this.saveTimer); this.saveTimer = null;
     await this.processing;
-    if (this.executions.size) {
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([Promise.allSettled([...this.executions]), new Promise<void>(resolve => { timeout = setTimeout(resolve, 4000); })]);
-      if (timeout) clearTimeout(timeout);
-    }
     await this.persist(); await this.storage.close(); await this.suggestionStorage.close();
   }
 }

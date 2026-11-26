@@ -8,6 +8,7 @@ import type { InsightJob, InsightReport } from "../shared/insights";
 import { insightJobSchema } from "../shared/insights";
 import type { SessionTrajectory } from "../shared/trajectory";
 import { InsightManager, type InsightManagerOptions } from "../server/insights";
+import { fakeClaude, type FakeRun } from "./fake-claude";
 import { fitInsightReport, MAX_REPORT_BYTES } from "../server/insight-storage";
 import { fetchTrajectory } from "../server/trajectory";
 
@@ -26,11 +27,10 @@ async function wait(manager: InsightManager, id: string, statuses: InsightJob["s
   for (let index = 0; index < 1000; index++) { const job = (await manager.state()).jobs.find(item => item.id === id); if (job && statuses.includes(job.status)) return job; await new Promise(done => setTimeout(done, 2)); }
   throw new Error("job did not settle");
 }
-async function fixture(options: InsightManagerOptions = {}) {
+async function fixture({ run = async () => JSON.stringify(report()), ...options }: InsightManagerOptions & { run?: FakeRun } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "observatory-ai-upgrade-"));
-  const manager = new InsightManager({ directory, now: () => epoch, findBinary: async () => "/fake", fetch: async (_p, id) => trajectory(id), run: async () => JSON.stringify(report()), ...options });
-  // These tests drive the Grok CLI path: `auto` no longer picks Grok, so choose it by name as a user would.
-  await manager.configure({ runner: { kind: "grok" } });
+  const { runPaseo, registry } = fakeClaude(run);
+  const manager = new InsightManager({ directory, now: () => epoch, fetch: async (_p, id) => trajectory(id), runPaseo, registry, ...options });
   return { directory, manager, async close() { await manager.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 test("migrates legal legacy history over eight megabytes without losing disabled settings", async () => {
@@ -39,10 +39,10 @@ test("migrates legal legacy history over eight megabytes without losing disabled
   assert.ok(jobs.every(job => insightJobSchema.safeParse(job).success));
   const legacy = JSON.stringify({ version: 1, settings: { autoEnabled: false, minTurns: 3, minTools: 3, cooldownHours: 6 }, jobs, fingerprints: {} });
   assert.ok(Buffer.byteLength(legacy) > 8000000); await writeFile(join(directory, "insights.json"), legacy);
-  const first = new InsightManager({ directory, findBinary: async () => "/fake" });
+  const first = new InsightManager({ directory, ...fakeClaude() });
   let second: InsightManager | undefined;
   try { const state = await first.state(); assert.equal(state.jobs.length, 60); assert.equal(state.settings.autoEnabled, false); await first.close();
-    second = new InsightManager({ directory, findBinary: async () => "/fake" }); assert.equal((await second.state()).jobs.length, 60); assert.equal((await second.state()).settings.autoEnabled, false);
+    second = new InsightManager({ directory, ...fakeClaude() }); assert.equal((await second.state()).jobs.length, 60); assert.equal((await second.state()).settings.autoEnabled, false);
     assert.equal((await readdir(join(directory, "insight-reports"))).filter(name => name.endsWith(".json")).length, 60);
   } finally { await first.close(); await second?.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -50,14 +50,14 @@ test("corrupt index recovers independent reports and never enables disabled auto
   const f = await fixture(); let restored: InsightManager | undefined;
   try { const job = await f.manager.start(paseo, "a"); await wait(f.manager, job.id); await f.manager.configure(false); await f.manager.close();
     await writeFile(join(f.directory, "insight-index.json"), "{broken");
-    restored = new InsightManager({ directory: f.directory, findBinary: async () => "/fake" });
+    restored = new InsightManager({ directory: f.directory, ...fakeClaude() });
     assert.equal((await restored.state()).settings.autoEnabled, false); assert.equal((await restored.state()).jobs.filter(job => job.report).length, 1);
   } finally { await restored?.close(); await f.close(); }
 });
 test("unrecoverable configuration fails closed while reports remain readable", async () => {
   const f = await fixture(); let restored: InsightManager | undefined;
   try { const job = await f.manager.start(paseo, "a"); await wait(f.manager, job.id); await f.manager.close(); await writeFile(join(f.directory, "insight-settings.json"), "invalid");
-    restored = new InsightManager({ directory: f.directory, findBinary: async () => "/fake" });
+    restored = new InsightManager({ directory: f.directory, ...fakeClaude() });
     assert.equal((await restored.state()).settings.autoEnabled, false); assert.equal((await restored.state()).jobs.length, 1);
     await assert.rejects(restored.start(paseo, "b", "auto"), /关闭/);
   } finally { await restored?.close(); await f.close(); }
@@ -98,7 +98,7 @@ test("feedback persists independently and new turns mark an existing report stal
   try { const job = await f.manager.start(paseo, "a"); const done = await wait(f.manager, job.id); assert.equal(done.source?.endSeq, 11);
     await f.manager.feedback(job.id, "finding", "resolved"); f.manager.turnStarted("a"); f.manager.turnEnded("a");
     assert.equal((await f.manager.report(job.id)).job?.freshness?.newTurns, 1); assert.equal((await f.manager.report(job.id)).job?.freshness?.state, "new_activity");
-    await f.manager.close(); restored = new InsightManager({ directory: f.directory, findBinary: async () => "/fake" });
+    await f.manager.close(); restored = new InsightManager({ directory: f.directory, ...fakeClaude() });
     assert.equal((await restored.report(job.id)).job?.findingFeedback?.finding.status, "resolved"); assert.equal((await restored.report(job.id)).job?.freshness?.newTurns, 1);
   } finally { await restored?.close(); await f.close(); }
 });

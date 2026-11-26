@@ -3,8 +3,8 @@ import { useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { Icon } from "@getpaseo/plugin/client/react-native";
-import { GROK_DEFAULT_EFFORT, GROK_DEFAULT_MODEL, GROK_EFFORTS, grokModelSchema, type GrokEffort, type InsightRunner, type InsightRunnerOption } from "../shared/insights";
-import { Badge, Banner, Button, Chip, Skeleton, TextField, fontSize, hue, isDarkTheme, radius, space, withAlpha, type Hue } from "./kit";
+import type { InsightRunner, InsightRunnerOption } from "../shared/insights";
+import { Badge, Banner, Button, Chip, Skeleton, fontSize, hue, isDarkTheme, radius, space, withAlpha, type Hue } from "./kit";
 import { useInsightModels } from "./use-insight-overview";
 
 /** Who writes reports and suggestions (分析设置) and 每轮小结 (recap-settings.tsx): the runner choices both offer. */
@@ -42,35 +42,6 @@ export function Choice({ theme, option, selected, badge, onPress }: { theme: Plu
       {option.reason ? <Text style={{ color: hue(theme, option.available ? "amber" : "red", "text"), fontSize: fontSize.meta }}>{option.reason}</Text> : null}
     </View>
   </Pressable>;
-}
-
-type GrokRunner = Extract<InsightRunner, { kind: "grok" }>;
-/**
- * The built-in Grok CLI's model and reasoning effort; unset values are the defaults, so an untouched choice stays `{ kind: "grok" }`.
- * `defaultEffort`: what an unset effort means (xhigh for analyses, low for 每轮小结).
- */
-export function GrokOptions({ theme, runner, busy, onSave, defaultEffort = GROK_DEFAULT_EFFORT }: { theme: PluginTheme; runner: GrokRunner; busy: boolean; onSave: (runner: GrokRunner) => void; defaultEffort?: GrokEffort }) {
-  const { colors } = theme;
-  const [model, setModel] = useState(runner.model ?? "");
-  const [effort, setEffort] = useState<GrokEffort>(runner.effort ?? defaultEffort);
-  useEffect(() => { setModel(runner.model ?? ""); setEffort(runner.effort ?? defaultEffort); }, [runner.model, runner.effort, defaultEffort]);
-  const id = model.trim(), valid = !id || grokModelSchema.safeParse(id).success;
-  const next: GrokRunner = { kind: "grok", ...(id && id !== GROK_DEFAULT_MODEL ? { model: id } : {}), ...(effort !== defaultEffort ? { effort } : {}) };
-  const changed = next.model !== runner.model || next.effort !== runner.effort;
-  return <View style={{ gap: space.md, marginLeft: space.md, padding: space.md, borderRadius: radius.lg, borderWidth: 1, borderColor: withAlpha(hue(theme, "teal"), 0.35) }}>
-    <TextField theme={theme} label={t("coreInsightSettings.grokModel")} value={model} onChangeText={setModel} placeholder={t("coreInsightSettings.default", { value1: GROK_DEFAULT_MODEL })}
-      hint={valid ? t("coreInsightSettings.leaveBlankForTheDefaultModelOther") : t("coreInsightSettings.modelIdsMayContainOnlyLettersNumbers")} />
-    <View style={{ gap: space.xs }}>
-      <Text style={{ color: colors.foregroundMuted, fontSize: fontSize.meta, fontWeight: "500" }}>{t("coreInsightSettings.reasoningLevel")}</Text>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
-        {GROK_EFFORTS.map(option => <Chip key={option} theme={theme} label={option === defaultEffort ? t("coreInsightSettings.default", { value1: option }) : option} tone="violet" selected={effort === option} onPress={() => setEffort(option)} />)}
-      </View>
-    </View>
-    <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
-      <Button theme={theme} variant="primary" icon="Check" label={t("coreInsightSettings.saveGrokSettings")} busy={busy} disabled={busy || !valid || !changed} onPress={() => onSave(next)} />
-      {runner.model || runner.effort ? <Button theme={theme} variant="ghost" icon="RotateCcw" label={t("coreInsightSettings.restoreDefaults")} disabled={busy} onPress={() => onSave({ kind: "grok" })} /> : null}
-    </View>
-  </View>;
 }
 
 /** Provider → model → thinking, for models no profile covers. */

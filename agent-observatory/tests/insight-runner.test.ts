@@ -6,18 +6,18 @@ import { z } from "zod";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listInsightModels, listInsightRunners } from "../shared/insights";
+import { insightRunnerSchema, listInsightModels, listInsightRunners } from "../shared/insights";
 import { extractInsightJson } from "../server/insight-analysis";
-import { BUILTIN_INSIGHT_RUNNER, CLAUDE_DISALLOWED_TOOLS, CLAUDE_LOCKDOWN_OPTIONS, CODEX_PASEO_MCP_STUB, INSIGHT_PERMISSION_MESSAGE, InsightRunnerRegistry, NO_RUNNER_ERROR, claudeAllowRuleTools, cleanupInsightAgents, codexMcpStubs, filterInsightFeatures, insightAnalysisMode, isInsightAgent, runPaseoStructured, type InsightRunnerPlan, type PaseoStructuredRunOptions } from "../server/insight-runner";
+import { CLAUDE_DISALLOWED_TOOLS, CLAUDE_LOCKDOWN_OPTIONS, CODEX_PASEO_MCP_STUB, INSIGHT_PERMISSION_MESSAGE, InsightRunnerRegistry, NO_RUNNER_ERROR, claudeAllowRuleTools, cleanupInsightAgents, codexMcpStubs, filterInsightFeatures, insightAnalysisMode, isInsightAgent, runPaseoStructured, type InsightRunnerPlan, type PaseoStructuredRunOptions } from "../server/insight-runner";
 
 const mode = (id: string, extra: Record<string, unknown> = {}): AgentMode => ({ id, label: id, ...extra });
 const entry = (provider: string, extra: Record<string, unknown> = {}) => ({ provider, label: provider, status: "ready", enabled: true, modes: [mode("ask")], models: [], ...extra });
 function catalogFixture(entries: unknown[], profiles: unknown[] = [], extra: Record<string, unknown> = {}, configProviders: Record<string, unknown> = {}) {
-  let now = 0, configs = 0, snapshots = 0, binaries = 0;
+  let now = 0, configs = 0, snapshots = 0;
   const argumentsSeen: unknown[][] = [];
   const paseo = { config: { get: async () => { configs++; return { config: { providers: configProviders, agentProfiles: profiles } }; } }, providers: { snapshot: async (...args: unknown[]) => { snapshots++; argumentsSeen.push(args); return { entries, ...extra }; } } } as unknown as PaseoApi;
-  const registry = new InsightRunnerRegistry(paseo, { now: () => now, cacheMs: 1, findBinary: async () => { binaries++; return "/fake/grok"; }, readCodexConfig: async () => null });
-  return { registry, argumentsSeen, tick(value: number) { now = value; }, counts: () => ({ configs, snapshots, binaries }) };
+  const registry = new InsightRunnerRegistry(paseo, { now: () => now, cacheMs: 1, readCodexConfig: async () => null });
+  return { registry, argumentsSeen, tick(value: number) { now = value; }, counts: () => ({ configs, snapshots }) };
 }
 
 const READ_ONLY_CODEX = { sandbox_mode: "read-only", approval_policy: "never", web_search: "disabled" };
@@ -77,44 +77,52 @@ test("runner features are an allowlist: speed and reasoning switches stay, anyth
 test("runner registry resolves profiles and defaults and shares a minimum sixty-second cache without cwd probes", async () => {
   const f = catalogFixture([entry("custom", { label: "Codex", modes: [mode("auto"), mode("full-access")], models: [{ provider: "custom", id: "m", label: "Model M", isDefault: true, thinkingOptions: [{ id: "high", label: "High", isDefault: true }] }] })],
     [{ id: "p", name: "Reviewer", provider: "custom", modeId: "full-access", notes: "a".repeat(500), featureValues: { fast_mode: true, yolo: true } }], {}, { custom: { extends: "codex" } });
-  assert.deepEqual((await f.registry.resolve({ kind: "grok" })).info, BUILTIN_INSIGHT_RUNNER); assert.deepEqual(f.counts(), { configs: 0, snapshots: 0, binaries: 0 });
+  assert.deepEqual(f.counts(), { configs: 0, snapshots: 0 });
   const [profile, direct, runners, models] = await Promise.all([f.registry.resolve({ kind: "profile", profileId: "p" }), f.registry.resolve({ kind: "provider", provider: "custom", model: null, thinkingOptionId: null }), f.registry.runners(), f.registry.models("custom")]);
   assert.equal(profile.info.label, "Reviewer"); assert.equal(profile.info.modeId, "auto"); assert.deepEqual(profile.providerOptions, READ_ONLY_CODEX); assert.deepEqual(profile.mcpServers, CODEX_PASEO_MCP_STUB); assert.equal(profile.claudeLockdown, undefined); assert.equal(profile.model, "m"); assert.equal(profile.effort, "high"); assert.deepEqual(profile.featureValues, { fast_mode: true });
   assert.equal(direct.info.label, "Codex · custom · Model M · High"); assert.equal(runners.profiles[0].detail?.length, 400); assert.equal(runners.profiles[0].thinkingLabel, "High");
   assert.ok(listInsightRunners.output.safeParse(runners).success); assert.ok(listInsightModels.output.safeParse(models).success);
-  assert.deepEqual(f.counts(), { configs: 1, snapshots: 1, binaries: 1 }); assert.deepEqual(f.argumentsSeen, [[]]);
-  f.tick(59_999); await f.registry.runners(); assert.deepEqual(f.counts(), { configs: 1, snapshots: 1, binaries: 1 });
-  f.tick(60_000); await f.registry.runners(); assert.deepEqual(f.counts(), { configs: 2, snapshots: 2, binaries: 2 });
+  assert.deepEqual(f.counts(), { configs: 1, snapshots: 1 }); assert.deepEqual(f.argumentsSeen, [[]]);
+  f.tick(59_999); await f.registry.runners(); assert.deepEqual(f.counts(), { configs: 1, snapshots: 1 });
+  f.tick(60_000); await f.registry.runners(); assert.deepEqual(f.counts(), { configs: 2, snapshots: 2 });
 });
 
-test("auto never runs the Grok CLI: Codex, then a locked-down Claude Code, then providers that extend them", async () => {
+test("auto picks a locked-down Claude Code, then Codex, then providers that extend them; the built-in choice is Claude Code", async () => {
   const providers = (entries: unknown[], config: Record<string, unknown> = {}, codexToml: string | null = null) => {
     const paseo = { config: { get: async () => ({ config: { providers: config, agentProfiles: [] } }) }, providers: { snapshot: async () => ({ entries }) } } as unknown as PaseoApi;
-    return new InsightRunnerRegistry(paseo, { findBinary: async () => "/fake/grok", readCodexConfig: async () => codexToml });
+    return new InsightRunnerRegistry(paseo, { readCodexConfig: async () => codexToml });
   };
   const models = [{ provider: "claude", id: "claude-opus-5-5", label: "Opus 5.5", isDefault: true, thinkingOptions: [{ id: "high", label: "high", isDefault: true }] }];
-  // Grok is installed and Claude Code is the only usable provider: auto picks Claude Code in plan mode, not Grok.
-  const withGrok = providers([entry("claude", { label: "Claude Code", modes: claudeCodeModes, models })]);
-  const claude = await withGrok.resolve({ kind: "auto" });
+  const onlyClaude = providers([entry("claude", { label: "Claude Code", modes: claudeCodeModes, models })]);
+  const claude = await onlyClaude.resolve({ kind: "auto" });
   assert.deepEqual([claude.info.kind, claude.info.provider, claude.model, claude.effort, claude.access, claude.info.modeId, claude.claudeLockdown], ["provider", "claude", "claude-opus-5-5", "high", "read", "plan", true]);
   assert.deepEqual(claude.providerOptions!.disallowedTools, [...CLAUDE_DISALLOWED_TOOLS]); assert.equal(claude.mcpServers, undefined);
-  const grokRunners = await withGrok.runners();
-  assert.deepEqual([grokRunners.auto.available, grokRunners.auto.access], [true, "read"]); assert.ok(!grokRunners.auto.providerLabel?.includes("Grok"));
-  assert.ok(listInsightRunners.output.safeParse(grokRunners).success);
-  // Grok stays available when chosen by name.
-  assert.deepEqual((await withGrok.resolve({ kind: "grok" })).info, BUILTIN_INSIGHT_RUNNER);
+  const runners = await onlyClaude.runners();
+  assert.deepEqual([runners.auto.available, runners.auto.access], [true, "read"]);
+  // The built-in choice is Claude Code with its default model, locked down; it is the provider runner for "claude".
+  assert.deepEqual(runners.builtin.runner, { kind: "provider", provider: "claude", model: null, thinkingOptionId: null });
+  assert.deepEqual([runners.builtin.label, runners.builtin.available, runners.builtin.access, runners.builtin.modeId, runners.builtin.modelLabel, runners.builtin.thinkingLabel], ["Claude Code", true, "read", "plan", "Opus 5.5", "high"]);
+  assert.ok(listInsightRunners.output.safeParse(runners).success);
+  // Without Claude Code the built-in choice is listed as unavailable, with the reason.
+  const withoutClaude = await providers([entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] })]).runners();
+  assert.equal(withoutClaude.builtin.available, false); assert.ok(withoutClaude.builtin.reason); assert.equal(withoutClaude.auto.available, true);
+  // A Grok runner saved by an earlier version reads as auto.
+  assert.deepEqual(insightRunnerSchema.parse({ kind: "grok", model: "grok-4.7", effort: "xhigh" }), { kind: "auto" });
   // Claude Code with only Always Ask (no plan mode) is not usable.
   await assert.rejects(providers([entry("claude", { modes: [mode("default", { colorTier: "safe" })] })]).resolve({ kind: "auto" }), error => error instanceof Error && error.message === NO_RUNNER_ERROR);
-  // Codex comes first, with its read-only sandbox and the user's MCP servers replaced by stubs.
-  const codex = await providers([entry("opencode", { modes: [mode("plan")] }), entry("claude", { label: "Claude Code", modes: claudeCodeModes, models }), entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] })],
+  // Claude Code comes first when both are usable.
+  const both = await providers([entry("opencode", { modes: [mode("plan")] }), entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] }), entry("claude", { label: "Claude Code", modes: claudeCodeModes, models })]).resolve({ kind: "auto" });
+  assert.equal(both.info.provider, "claude");
+  // Without Claude Code, Codex, with its read-only sandbox and the user's MCP servers replaced by stubs.
+  const codex = await providers([entry("opencode", { modes: [mode("plan")] }), entry("claude", { status: "unavailable" }), entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] })],
     {}, "[mcp_servers.gmail]\nurl = \"https://x\"\n").resolve({ kind: "auto" });
   assert.deepEqual([codex.info.provider, codex.info.modeId, codex.providerOptions, codex.mcpServers], ["codex", "auto", READ_ONLY_CODEX,
     { gmail: { type: "http", url: "http://127.0.0.1:9/mcp" }, paseo: { type: "stdio", command: "/usr/bin/false", args: [] } }]);
-  // The built-ins are off; custom providers that extend them are used, Codex-based first. Other providers never are.
+  // The built-ins are off; custom providers that extend them are used, Claude-based first. Other providers never are.
   const extendedRegistry = providers([entry("acp-reader", { modes: [mode("plan")] }), entry("codex-team", { modes: [mode("auto"), mode("full-access")] }), entry("claude-team", { modes: claudeCodeModes }), entry("claude"), entry("codex")],
     { claude: { enabled: false }, codex: { enabled: false }, "claude-team": { extends: "claude" }, "codex-team": { extends: "codex" }, "acp-reader": { extends: "acp" } });
   const extended = await extendedRegistry.resolve({ kind: "auto" });
-  assert.equal(extended.info.provider, "codex-team");
+  assert.equal(extended.info.provider, "claude-team");
   // A custom provider that extends Claude Code is locked down the same way.
   const claudeTeam = await extendedRegistry.resolve({ kind: "provider", provider: "claude-team", model: null, thinkingOptionId: null });
   assert.deepEqual([claudeTeam.info.modeId, claudeTeam.access, claudeTeam.claudeLockdown], ["plan", "read", true]);
@@ -133,12 +141,12 @@ test("right after the daemon starts, the registry waits for provider discovery i
   let waited = 0;
   const paseo = { config: { get: async () => ({ config: { providers: {}, agentProfiles: [] } }) },
     providers: { snapshot: async () => ({ entries: loading }), waitForReady: async (options: { timeoutMs?: number }) => { waited++; assert.equal(options.timeoutMs, 8_000); return { entries: ready }; } } } as unknown as PaseoApi;
-  const resolved = await new InsightRunnerRegistry(paseo, { findBinary: async () => null }).resolve({ kind: "auto" });
+  const resolved = await new InsightRunnerRegistry(paseo).resolve({ kind: "auto" });
   assert.equal(resolved.info.provider, "claude");
   assert.equal(waited, 1);
   // A host without waitForReady, or one whose discovery doesn't finish, keeps the snapshot it has.
   const stuck = { ...paseo, providers: { snapshot: async () => ({ entries: loading }), waitForReady: async () => { throw new Error("timeout"); } } } as unknown as PaseoApi;
-  await assert.rejects(new InsightRunnerRegistry(stuck, { findBinary: async () => null }).resolve({ kind: "auto" }));
+  await assert.rejects(new InsightRunnerRegistry(stuck).resolve({ kind: "auto" }));
 });
 
 test("runner registry retains unavailable profiles and refuses providers that only ask before each tool", async () => {
@@ -185,7 +193,7 @@ test("runner models resolve compact thinking sets and put defaults first within 
 test("runner registry caches catalog failures and returns a Chinese error", async () => {
   let requests = 0, now = 0;
   const paseo = { config: { get: async () => { requests++; throw new Error("offline"); } }, providers: { snapshot: async () => ({ entries: [] }) } } as unknown as PaseoApi;
-  const registry = new InsightRunnerRegistry(paseo, { now: () => now, findBinary: async () => null });
+  const registry = new InsightRunnerRegistry(paseo, { now: () => now });
   await assert.rejects(registry.runners(), /无法读取分析执行器列表.*offline/); await assert.rejects(registry.models("a"), /无法读取分析执行器列表/); assert.equal(requests, 1);
   now = 60_000; await assert.rejects(registry.runners(), /无法读取分析执行器列表/); assert.equal(requests, 2);
 });

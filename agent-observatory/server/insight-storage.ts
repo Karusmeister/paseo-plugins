@@ -92,7 +92,7 @@ export class InsightStorage {
     const config = join(this.directory, "insight-settings.json"), index = join(this.directory, "insight-index.json"), legacy = join(this.directory, "insights.json");
     try { const raw = await this.read(config, 65536); if (raw !== undefined) {
       const saved = settingsFileSchema.parse(raw); settings = saved.settings; settingsKnown = true;
-      if (saved.version === 1) { settings = { ...settings, autoEnabled: false, runner: { kind: "grok" } }; settingsMigrated = true; }
+      if (saved.version === 1) { settings = { ...settings, autoEnabled: false, runner: { kind: "auto" } }; settingsMigrated = true; }
       else this.savedSettings = JSON.stringify(settings);
     } }
     catch { settingsBroken = true; settings.autoEnabled = false; this.error = t("serverInsightStorage.m003"); await this.backup(config); }
@@ -117,7 +117,7 @@ export class InsightStorage {
         const old = await this.read(legacy, 128 * 1024 * 1024);
         if (old !== undefined) {
           imported = true; const saved = old as Record<string, unknown>;
-          if (!settingsKnown && !settingsBroken) { const parsed = insightSettingsSchema.safeParse(saved.settings); result.settings = { ...(parsed.success ? parsed.data : defaults), autoEnabled: false, runner: { kind: "grok" } }; }
+          if (!settingsKnown && !settingsBroken) { const parsed = insightSettingsSchema.safeParse(saved.settings); result.settings = { ...(parsed.success ? parsed.data : defaults), autoEnabled: false, runner: { kind: "auto" } }; }
           if (Array.isArray(saved.jobs)) for (const value of saved.jobs) {
             const parsed = insightJobSchema.safeParse(value); if (!parsed.success) { this.error = t("serverInsightStorage.m008"); continue; }
             try { result.jobs.push(fitInsightReport(parsed.data)); } catch { this.error = t("serverInsightStorage.m009"); }

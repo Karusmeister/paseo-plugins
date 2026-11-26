@@ -9,6 +9,9 @@ import type { InsightJob, InsightReport } from "../shared/insights";
 import { suggestionJobSchema, type SuggestionJob, type SuggestionReport } from "../shared/insight-overview";
 import type { SessionTrajectory } from "../shared/trajectory";
 import { InsightManager, type InsightManagerOptions } from "../server/insights";
+import { fakeClaude, fakePlan, type FakeRun } from "./fake-claude";
+import type { InsightRunner } from "../shared/insights";
+import type { InsightRunnerPlan } from "../server/insight-runner";
 import { InsightStorage } from "../server/insight-storage";
 
 const epoch = Date.parse("2026-09-23T12:00:00Z");
@@ -25,7 +28,7 @@ const trajectory = (id: string): SessionTrajectory => ({ agent: { id, title: id,
   rows: Array.from({ length: 12 }, (_, i) => ({ ref: `r${i}`, epoch: "e", seqStart: i, seqEnd: i, at, turnId: null, kind: i < 3 ? "user_message" : i < 6 ? "tool_call" : "assistant_message", text: "有据的执行结果", toolName: null, toolStatus: null })),
   coverage: { complete: true, hasOlder: false, hasNewer: false, gap: false, truncated: false, reason: null, projectedItems: 12, characters: 100, pages: 1, firstAt: at, lastAt: at, epoch: "e" },
   counts: { userTurns: 3, tools: 3, assistantMessages: 6, toolFailures: 0, errors: 0, observedTurnIds: 3 }, completionEvidence: { kind: "attention_finished", at } });
-const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi;
+const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }), ref: (id: string) => ({ refresh: async () => ({ agent: { id, cwd: "/repo", workspaceId: "workspace", title: id, archivedAt: null }, project: null }) }) } } as unknown as PaseoApi;
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 async function until<T>(read: () => Promise<T | undefined>, predicate: (value: T) => boolean): Promise<T> {
   for (let n = 0; n < 10000; n++) { const value = await read(); if (value && predicate(value)) return value; await tick(); }
@@ -33,12 +36,17 @@ async function until<T>(read: () => Promise<T | undefined>, predicate: (value: T
 }
 const waitReport = (manager: InsightManager, id: string, status = "completed") => until(async () => (await manager.report(id)).job ?? undefined, job => job.status === status);
 const waitSuggestion = (manager: InsightManager, id: string, status = "completed") => until(async () => (await manager.suggestions(id)).job ?? undefined, job => job.status === status);
-async function fixture(options: InsightManagerOptions = {}, jobs = [seed("old1"), seed("old2", 1)]) {
+/**
+ * `run`: the helper's text, through the fake Claude runner (tests/fake-claude.ts). `real`: the real registry and runner,
+ * for tests that drive a fake Paseo host. `resolve`: replaces the fake registry's resolve (to make it wait).
+ */
+async function fixture({ run = async ({ prompt }) => JSON.stringify(prompt.includes("<reports_data>") ? suggestion : report), real = false, resolve, ...options }:
+  InsightManagerOptions & { run?: FakeRun; real?: boolean; resolve?: (runner: InsightRunner) => Promise<InsightRunnerPlan> } = {}, jobs = [seed("old1"), seed("old2", 1)]) {
   const directory = await mkdtemp(join(tmpdir(), "insight-queue-")); const storage = new InsightStorage(directory);
-  const settings = { autoEnabled: false, minTurns: 3, minTools: 3, cooldownHours: 6, runner: { kind: "grok" as const } };
+  const settings = { autoEnabled: false, minTurns: 3, minTools: 3, cooldownHours: 6, runner: { kind: "auto" as const } };
   await storage.saveSettings(settings); await storage.save({ settings, jobs, cooldowns: {}, activity: {}, revision: 1 }); await storage.close();
-  const manager = new InsightManager({ directory, now: () => epoch, findBinary: async () => "/fake/grok", fetch: async (_p, id) => trajectory(id),
-    run: async ({ prompt }) => JSON.stringify(prompt.includes("<reports_data>") ? suggestion : report), ...options });
+  const { runPaseo, registry } = fakeClaude(run, resolve ? { resolve } : {});
+  const manager = new InsightManager({ directory, now: () => epoch, fetch: async (_p, id) => trajectory(id), ...(real ? {} : { runPaseo, registry }), ...options });
   return { directory, manager, close: async () => { await manager.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 test("suggestions skip fewer than two reports without launching a runner", async () => {
@@ -46,13 +54,19 @@ test("suggestions skip fewer than two reports without launching a runner", async
   try { const job = await f.manager.suggest(paseo, 7); const done = await waitSuggestion(f.manager, job.id, "skipped"); assert.match(done.stage, /至少需要 2/); assert.equal(runs, 0); }
   finally { await f.close(); }
 });
-test("suggestions retry once, retain exact evidence and persist action feedback", async () => {
-  let runs = 0; const prompts: string[] = [];
-  const f = await fixture({ run: async ({ prompt, schema, systemPrompt }) => { runs++; prompts.push(prompt); assert.ok(schema); assert.match(systemPrompt!, /运营顾问/);
-    return JSON.stringify({ structured_output: runs === 1 ? { ...suggestion, actions: [{ ...suggestion.actions[0], evidence: ["invented"] }] } : suggestion, usage: { input_tokens: 5, output_tokens: 7 }, total_cost_usd: 0.1 }); } });
+test("suggestions with invented evidence fail after one helper run", async () => {
+  let runs = 0;
+  const f = await fixture({ run: async () => { runs++; return JSON.stringify({ structured_output: { ...suggestion, actions: [{ ...suggestion.actions[0], evidence: ["invented"] }] } }); } });
+  try { const job = await f.manager.suggest(paseo, 7); const done = await waitSuggestion(f.manager, job.id, "failed"); assert.equal(runs, 1); assert.equal(done.report, null); }
+  finally { await f.close(); }
+});
+test("suggestions retain exact evidence and persist action feedback", async () => {
+  let runs = 0;
+  const f = await fixture({ run: async ({ schema, systemPrompt }) => { runs++; assert.ok(schema); assert.match(systemPrompt!, /运营顾问/);
+    return JSON.stringify({ structured_output: suggestion, usage: { input_tokens: 5, output_tokens: 7 }, total_cost_usd: 0.1 }); } });
   try {
     const job = await f.manager.suggest(paseo, 7); const done = await waitSuggestion(f.manager, job.id); suggestionJobSchema.parse(done);
-    assert.equal(runs, 2); assert.match(prompts[1], /上次输出/); assert.equal(done.usage?.inputTokens, 10); assert.equal(done.evidence?.["R1#f1"].jobId, "old1");
+    assert.equal(runs, 1); assert.equal(done.usage?.inputTokens, 5); assert.equal(done.evidence?.["R1#f1"].jobId, "old1"); assert.equal(done.runner.provider, "claude");
     assert.equal((await f.manager.suggestions()).job?.id, job.id);
     await assert.rejects(f.manager.actionFeedback(job.id, "missing", "done"), /不存在/);
     await f.manager.actionFeedback(job.id, "action1", "adopted"); assert.equal((await f.manager.suggestions()).history[0].openActions, 0);
@@ -112,7 +126,7 @@ test("reload cancels stored suggestion jobs and never executes them", async () =
   try {
     const job = await f.manager.suggest(paseo, 7); const done = await waitSuggestion(f.manager, job.id); await f.manager.close();
     await writeFile(join(f.directory, "insight-suggestions.json"), JSON.stringify({ version: 1, jobs: [{ ...done, status: "analyzing", report: null }] }));
-    let runs = 0; restored = new InsightManager({ directory: f.directory, now: () => epoch + 1000, findBinary: async () => null, run: async () => { runs++; return "{}"; } });
+    let runs = 0; restored = new InsightManager({ directory: f.directory, now: () => epoch + 1000, ...fakeClaude(async () => { runs++; return "{}"; }) });
     const recovered: SuggestionJob | null = (await restored.suggestions(job.id)).job; assert.equal(recovered?.status, "canceled"); assert.equal(runs, 0);
   } finally { await restored?.close(); await f.close(); }
 });
@@ -132,8 +146,8 @@ function fakeProvider(options: { output: string; archived?: boolean; gate?: Prom
   } as unknown as PaseoApi;
   return { api, creations, archives: () => archives };
 }
-test("configured Paseo report runs without Grok and records resolved runner plus real session usage", async () => {
-  const fake = fakeProvider({ output: JSON.stringify(report) }); const f = await fixture({ findBinary: async () => null });
+test("configured Paseo report records resolved runner plus real session usage", async () => {
+  const fake = fakeProvider({ output: JSON.stringify(report) }); const f = await fixture({ real: true });
   try {
     await f.manager.configure({ runner: { kind: "profile", profileId: "reader" } });
     const queued = await f.manager.start(fake.api, "target"); const done = await waitReport(f.manager, queued.id);
@@ -147,7 +161,7 @@ test("configured Paseo report runs without Grok and records resolved runner plus
   } finally { await f.close(); }
 });
 test("Paseo suggestions use the newest source's existing workspace when its parent is archived", async () => {
-  const fake = fakeProvider({ output: JSON.stringify(suggestion), archived: true }); const f = await fixture({ findBinary: async () => null });
+  const fake = fakeProvider({ output: JSON.stringify(suggestion), archived: true }); const f = await fixture({ real: true });
   try {
     const queued = await f.manager.suggest(fake.api, 7, { kind: "profile", profileId: "reader" }); const done = await waitSuggestion(f.manager, queued.id);
     assert.equal(done.runner.sessionAgentId, "analysis-1"); assert.equal(fake.archives(), 1); assert.equal(done.usage?.inputTokens, 20);
@@ -156,17 +170,17 @@ test("Paseo suggestions use the newest source's existing workspace when its pare
   } finally { await f.close(); }
 });
 test("a runner change during cleanup applies only to later dequeued work", async () => {
-  const cleanup = deferred<unknown>(), fake = fakeProvider({ output: JSON.stringify(suggestion), gate: cleanup.promise }); let grokCalls = 0;
-  const f = await fixture({ run: async () => { grokCalls++; return JSON.stringify(report); } });
+  const cleanup = deferred<unknown>(), fake = fakeProvider({ output: JSON.stringify(suggestion), gate: cleanup.promise }); let calls = 0;
+  const f = await fixture({ run: async ({ prompt }) => { calls++; return JSON.stringify(prompt.includes("<reports_data>") ? suggestion : report); } });
   try {
     await f.manager.configure({ runner: { kind: "profile", profileId: "reader" } });
     const first = await f.manager.suggest(fake.api, 7); await waitSuggestion(f.manager, first.id, "collecting");
-    await f.manager.configure({ runner: { kind: "grok" } }); const next = await f.manager.start(fake.api, "later");
+    await f.manager.configure({ runner: { kind: "auto" } }); const next = await f.manager.start(fake.api, "later");
     cleanup.resolve(undefined); const firstDone = await waitSuggestion(f.manager, first.id); const nextDone = await waitReport(f.manager, next.id);
-    assert.equal(firstDone.runner.kind, "profile"); assert.equal(nextDone.runner?.kind, "grok"); assert.equal(grokCalls, 1);
+    assert.equal(firstDone.runner.kind, "profile"); assert.equal(nextDone.runner?.kind, "provider"); assert.equal(nextDone.runner?.provider, "claude"); assert.equal(calls, 2);
   } finally { cleanup.resolve(undefined); await f.close(); }
 });
-test("simultaneous starts coalesce even when binary discovery yields", async () => {
+test("simultaneous starts coalesce even when resolving the runner yields", async () => {
   const gate = deferred<string>(); const f = await fixture({ run: async () => gate.promise });
   try {
     const jobs = await Promise.all(Array.from({ length: 12 }, () => f.manager.start(paseo, "same")));
@@ -174,12 +188,12 @@ test("simultaneous starts coalesce even when binary discovery yields", async () 
     gate.resolve(JSON.stringify(report)); await waitReport(f.manager, jobs[0].id);
   } finally { gate.resolve(JSON.stringify(report)); await f.close(); }
 });
-test("disabling auto during binary lookup cannot enqueue automatic work afterward", async () => {
-  const gate = deferred<string | null>(); let probes = 0, runs = 0;
-  const f = await fixture({ findBinary: async () => ++probes === 2 ? gate.promise : "/fake", run: async () => { runs++; return JSON.stringify(report); } });
+test("disabling auto while the runner resolves cannot enqueue automatic work afterward", async () => {
+  const gate = deferred<void>(); let probes = 0, runs = 0;
+  const f = await fixture({ run: async () => { runs++; return JSON.stringify(report); }, resolve: async runner => { probes++; await gate.promise; return fakePlan(runner); } });
   try {
     await f.manager.configure(true); const pending = f.manager.start(paseo, "late-auto", "auto");
-    await until(async () => probes, count => count === 2); await f.manager.configure(false); gate.resolve("/fake");
+    await until(async () => probes, count => count === 1); await f.manager.configure(false); gate.resolve();
     await assert.rejects(pending, /关闭/); assert.equal(runs, 0);
-  } finally { gate.resolve("/fake"); await f.close(); }
+  } finally { gate.resolve(); await f.close(); }
 });

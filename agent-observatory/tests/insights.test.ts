@@ -7,9 +7,10 @@ import { setImmediate as nextTick } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
 import type { SessionTrajectory } from "../shared/trajectory";
 import type { InsightJob, InsightReport } from "../shared/insights";
-import { assessTrajectory, buildAnalysisPrompt, buildAnalysisRequest, isUsefulInsightReport, parseGrokReport, redactSecrets } from "../server/insight-analysis";
+import { assessTrajectory, buildAnalysisPrompt, buildAnalysisRequest, isUsefulInsightReport, parseInsightText, redactSecrets } from "../server/insight-analysis";
 import { InsightManager, type InsightManagerOptions } from "../server/insights";
-import { GROK_DISALLOWED_TOOLS, GrokTurnLimitError, runGrokAnalysis } from "../server/grok-runner";
+import { fakeClaude, FAKE_CLAUDE_PLAN, type FakeRun } from "./fake-claude";
+import { ANALYSIS_SYSTEM_PROMPT } from "../server/analysis-prompt";
 
 const paseo = {} as PaseoApi;
 function trajectory(turns = 3, tools = 3, length = 12): SessionTrajectory {
@@ -25,11 +26,10 @@ function report(evidence = ["ref-3"]): InsightReport { return { summary: "执行
   findings: [{ id: "one", severity: "low", category: "efficiency", title: "减少重复读取", detail: "重复读取相同输出", evidence, recommendation: "复用结果" }], strengths: ["已有验证"], nextActions: ["检查结果"], limitations: [] }; }
 const output = () => JSON.stringify({ structured_output: report(), usage: { input_tokens: 30, output_tokens: 20 }, total_cost_usd: 0.002 });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
-async function fixture(options: InsightManagerOptions = {}) {
+async function fixture({ run = async () => output(), ...options }: InsightManagerOptions & { run?: FakeRun } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "observatory-insight-test-"));
-  const manager = new InsightManager({ directory, findBinary: async () => "/fake/grok", fetch: async () => trajectory(), run: async () => output(), ...options });
-  // These tests drive the Grok CLI path: `auto` no longer picks Grok, so choose it by name as a user would.
-  await manager.configure({ runner: { kind: "grok" } });
+  const { runPaseo, registry } = fakeClaude(run);
+  const manager = new InsightManager({ directory, fetch: async () => trajectory(), runPaseo, registry, ...options });
   return { directory, manager, async close() { await manager.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 async function waitFor(manager: InsightManager, id: string, status: InsightJob["status"]) {
@@ -48,16 +48,16 @@ test("manual and automatic analysis enforce multiple turns and tools", () => {
   failure.agent.status = "running"; assert.equal(assessTrajectory(failure, "auto").eligible, false);
 });
 test("unknown evidence is removed and reduces confidence even beside valid evidence", () => {
-  const parsed = parseGrokReport(JSON.stringify(report(["ref-3", "invented", "ref-3"])), new Set(["ref-3"]));
+  const parsed = parseInsightText(JSON.stringify(report(["ref-3", "invented", "ref-3"])), new Set(["ref-3"]));
   assert.deepEqual(parsed.report.findings[0].evidence, ["ref-3"]); assert.equal(parsed.report.confidence, "low");
-  const unsupported = parseGrokReport(JSON.stringify({ ...report(["invented"]), health: "blocked" }), new Set());
+  const unsupported = parseInsightText(JSON.stringify({ ...report(["invented"]), health: "blocked" }), new Set());
   assert.equal(unsupported.report.findings.length, 0); assert.equal(unsupported.report.health, "watch");
 });
 test("JSON report parser handles CLI envelope and rejects malformed schemas", () => {
-  assert.equal(parseGrokReport(output(), new Set(["ref-3"])).usage?.outputTokens, 20);
-  assert.equal(parseGrokReport(JSON.stringify({ text: `\`\`\`json\n${JSON.stringify(report())}\n\`\`\`` }), new Set(["ref-3"])).report.summary, "执行过程清晰");
-  assert.throws(() => parseGrokReport("not JSON", new Set()), /JSON/);
-  assert.throws(() => parseGrokReport('{"summary":"incomplete"}', new Set()), /字段/);
+  assert.equal(parseInsightText(output(), new Set(["ref-3"])).usage?.outputTokens, 20);
+  assert.equal(parseInsightText(JSON.stringify({ text: `\`\`\`json\n${JSON.stringify(report())}\n\`\`\`` }), new Set(["ref-3"])).report.summary, "执行过程清晰");
+  assert.throws(() => parseInsightText("not JSON", new Set()), /JSON/);
+  assert.throws(() => parseInsightText('{"summary":"incomplete"}', new Set()), /字段/);
 });
 test("prompt redaction covers JSON fields, credentials, metadata and URL passwords", () => {
   const secrets = ["ghp_" + "a".repeat(28), "xai-" + "b".repeat(28), "private-password-value", "metadata-secret-value", "url-password-value"];
@@ -112,7 +112,7 @@ test("reload converts persisted unfinished jobs to canceled without resuming the
   const job: InsightJob = { id: "old", agentId: "a", agentTitle: "A", projectName: "P", createdAt: at, updatedAt: at,
     status: "analyzing", trigger: "auto", stage: "pending", eligibility: null, coverage: null, report: null, model: "grok-4.6", effort: "xhigh", usage: null, error: null };
   await writeFile(join(directory, "insights.json"), JSON.stringify({ version: 1, settings: { autoEnabled: true, minTurns: 3, minTools: 3, cooldownHours: 6 }, jobs: [job], fingerprints: {} }));
-  let called = false; const manager = new InsightManager({ directory, findBinary: async () => "/fake", run: async () => { called = true; return output(); } });
+  let called = false; const manager = new InsightManager({ directory, ...fakeClaude(async () => { called = true; return output(); }) });
   try { const state = await manager.state(); assert.equal(state.settings.autoEnabled, false); assert.equal(state.jobs[0].status, "canceled"); assert.equal(called, false); }
   finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -125,37 +125,14 @@ test("saved reports exclude input trajectory and private user question", async (
     for (const path of files) assert.equal((await readFile(path, "utf8")).includes(privateMarker), false);
   } finally { await f.close(); }
 });
-test("Grok runner uses isolated prompt file and removes it after fake CLI exits", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "fake-grok-test-")); const executable = join(directory, "grok-fake");
-  await writeFile(executable, '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({args:process.argv.slice(2),cwd:process.cwd()}));\n', { mode: 0o700 });
+test("analyses run as a locked-down Claude Code helper with the read-only analysis prompt", async () => {
+  const seen: Array<Parameters<FakeRun>[0]> = [];
+  const f = await fixture({ run: async call => { seen.push(call); return output(); } });
   try {
-    // A scratch GROK_HOME and temp root: the run's session cleanup never looks at the real ~/.grok here.
-    const response = JSON.parse(await runGrokAnalysis({ binary: executable, prompt: "fixture prompt", signal: new AbortController().signal, timeoutMs: 2000, grokHome: join(directory, "grok-home"), tmp: directory }));
-    assert.ok(response.args.includes("--json-schema")); assert.ok(response.args.includes("--no-subagents")); assert.ok(response.args.includes("--disable-web-search"));
-    assert.ok(response.args.includes("--system-prompt-override"));
-    assert.equal(response.args[response.args.indexOf("--model") + 1], "grok-4.7");
-    // `--tools ""` removed nothing (opus-F72): the built-in tools are removed by name and every call is still denied.
-    assert.equal(response.args.includes("--tools"), false);
-    assert.deepEqual(response.args[response.args.indexOf("--disallowed-tools") + 1].split(","), [...GROK_DISALLOWED_TOOLS]);
-    assert.equal(response.args[response.args.indexOf("--deny") + 1], "*");
-    assert.equal(response.args[response.args.indexOf("--max-turns") + 1], "3");
-    assert.equal(response.args.includes("fixture prompt"), false); await assert.rejects(stat(response.cwd), { code: "ENOENT" });
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
-test("Grok runner decodes Chinese output split across stdout chunks", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "fake-grok-test-")); const executable = join(directory, "grok-fake");
-  // "插件" is 6 UTF-8 bytes; the fake CLI writes them in two chunks that split the second character.
-  await writeFile(executable, '#!/usr/bin/env node\nconst bytes = Buffer.from("插件", "utf8"); process.stdout.write(bytes.subarray(0, 4)); setTimeout(() => process.stdout.write(bytes.subarray(4)), 50);\n', { mode: 0o700 });
-  try { assert.equal(await runGrokAnalysis({ binary: executable, prompt: "p", signal: new AbortController().signal, timeoutMs: 2000, grokHome: join(directory, "grok-home"), tmp: directory }), "插件"); }
-  finally { await rm(directory, { recursive: true, force: true }); }
-});
-test("a Grok turn limit reaches the report as a Chinese error and is retried at most once (opus-F72)", async () => {
-  let calls = 0;
-  const f = await fixture({ run: async () => { calls++; throw new GrokTurnLimitError(3); } });
-  try {
-    const job = await f.manager.start(paseo, "a"); const failed = await waitFor(f.manager, job.id, "failed");
-    assert.match(failed.error ?? "", /轮次上限/); assert.equal(/max turns/i.test(failed.error ?? ""), false);
-    assert.ok(calls >= 1 && calls <= 2, `one run, plus at most one compact retry (${calls})`);
+    const job = await f.manager.start(paseo, "a"); const completed = await waitFor(f.manager, job.id, "completed");
+    assert.equal(seen.length, 1); assert.equal(seen[0].systemPrompt, ANALYSIS_SYSTEM_PROMPT); assert.equal(seen[0].model, FAKE_CLAUDE_PLAN.model);
+    assert.deepEqual([completed.runner?.provider, completed.runner?.modeId, completed.runner?.kind], ["claude", "plan", "provider"]);
+    assert.match(completed.runner?.sessionAgentId ?? "", /^helper-/); assert.equal(completed.model, FAKE_CLAUDE_PLAN.model);
   } finally { await f.close(); }
 });
 test("fresh installation does not read trajectories or call the model until automation is enabled", async (context) => {
@@ -183,7 +160,7 @@ test("reload preserves an explicitly enabled automation setting", async () => {
   const f = await fixture(); let restored: InsightManager | undefined;
   try {
     await f.manager.configure(true); await f.manager.close();
-    restored = new InsightManager({ directory: f.directory, findBinary: async () => "/fake/grok" });
+    restored = new InsightManager({ directory: f.directory, ...fakeClaude() });
     assert.equal((await restored.state()).settings.autoEnabled, true);
   } finally { await restored?.close(); await f.close(); }
 });
@@ -219,7 +196,7 @@ test("automatic repeats respect six-hour cooldown and unchanged evidence fingerp
 });
 const emptyReport = () => ({ summary: "轨迹正文被截断，先读取完整待分析数据再出报告。", health: "watch", confidence: "low", findings: [], strengths: [], nextActions: [], limitations: ["内容容量"] });
 test("empty or deferred analysis is rejected instead of accepted as completed", () => {
-  assert.throws(() => parseGrokReport(JSON.stringify(emptyReport()), new Set()), /实际分析/);
+  assert.throws(() => parseInsightText(JSON.stringify(emptyReport()), new Set()), /实际分析/);
   assert.equal(isUsefulInsightReport({ ...report(), findings: [], strengths: [], nextActions: ["先读取完整轨迹再分析"] }), false);
   assert.equal(isUsefulInsightReport({ ...report(), findings: [], nextActions: [] }), true);
 });
@@ -238,23 +215,12 @@ test("model evidence is bounded and distributed across many turns with exact ref
   assert.equal(data.analysisWindow.sourceRows, 1000); assert.equal(data.analysisWindow.sampled, true);
   assert.match(normal.prompt, /现在就分析/); assert.match(compact.prompt, /上一次报告/);
 });
-test("an empty first report gets exactly one compact retry with source snippets retained", async () => {
-  let calls = 0; const prompts: string[] = [];
-  const f = await fixture({ run: async ({ prompt }) => { prompts.push(prompt); return ++calls === 1 ? JSON.stringify({ structured_output: emptyReport(), usage: { input_tokens: 10, output_tokens: 5 }, total_cost_usd: 0.001 }) : output(); } });
-  try {
-    const job = await f.manager.start(paseo, "a"); const completed = await waitFor(f.manager, job.id, "completed");
-    assert.equal(calls, 2); assert.match(prompts[1], /上一次报告/);
-    assert.equal(completed.evidence?.[0].ref, "ref-3"); assert.equal(completed.evidence?.[0].text, "Sample evidence");
-    assert.equal(completed.usage?.inputTokens, 40);
-  } finally { await f.close(); }
-});
-test("malformed first JSON also retries once and repeated empty reports fail", async () => {
-  let calls = 0; const recovered = await fixture({ run: async () => ++calls === 1 ? "{invalid" : output() });
-  try { const job = await recovered.manager.start(paseo, "a"); await waitFor(recovered.manager, job.id, "completed"); assert.equal(calls, 2); }
-  finally { await recovered.close(); }
-  calls = 0; const failed = await fixture({ run: async () => { calls++; return JSON.stringify(emptyReport()); } });
-  try { const job = await failed.manager.start(paseo, "a"); const result = await waitFor(failed.manager, job.id, "failed"); assert.equal(calls, 2); assert.equal(result.report, null); assert.match(result.error ?? "", /实际分析/); }
-  finally { await failed.close(); }
+test("an empty or malformed report fails the analysis and keeps no report", async () => {
+  for (const text of [JSON.stringify(emptyReport()), "{invalid"]) {
+    let calls = 0; const f = await fixture({ run: async () => { calls++; return text; } });
+    try { const job = await f.manager.start(paseo, "a"); const result = await waitFor(f.manager, job.id, "failed"); assert.equal(calls, 1); assert.equal(result.report, null); assert.ok(result.error); }
+    finally { await f.close(); }
+  }
 });
 test("load reclassifies old completed empty reports as failed while retaining inspection data", async () => {
   const directory = await mkdtemp(join(tmpdir(), "observatory-empty-report-"));
@@ -262,7 +228,7 @@ test("load reclassifies old completed empty reports as failed while retaining in
   const old = { id: "old-empty", agentId: "a", agentTitle: "A", projectName: "P", createdAt: at, updatedAt: at,
     status: "completed", trigger: "manual", stage: "completed", eligibility: null, coverage: null, report: emptyReport(), model: "grok-4.6", effort: "xhigh", usage: null, error: null };
   await writeFile(join(directory, "insights.json"), JSON.stringify({ version: 1, settings: { autoEnabled: true, minTurns: 3, minTools: 3, cooldownHours: 6 }, jobs: [old], fingerprints: {} }));
-  const manager = new InsightManager({ directory, findBinary: async () => "/fake" });
+  const manager = new InsightManager({ directory, ...fakeClaude() });
   try { const state = await manager.state(); assert.equal(state.jobs[0].status, "failed"); assert.match(state.jobs[0].error ?? "", /旧报告/); assert.equal(state.jobs[0].report?.summary, old.report.summary); }
   finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

@@ -5,20 +5,15 @@ import { onTextChange, translator } from "../shared/i18n";
 import { t } from "../shared/text";
 import type { PaseoApi, PaseoAgent, PaseoAgentCreateOptions, PaseoAgentHandle, PaseoAgentRunResult, PaseoProviderSnapshotResult, AgentMode } from "./paseo-types";
 import { z } from "zod";
-import { GROK_DEFAULT_EFFORT, GROK_DEFAULT_MODEL, grokRunnerLabel, type InsightJob, type InsightModelOption, type InsightRunner, type InsightRunnerInfo, type InsightRunnerOption, type InsightRunners } from "../shared/insights";
-import { findGrokBinary } from "./grok-runner";
+import { CLAUDE_RUNNER, type InsightJob, type InsightModelOption, type InsightRunner, type InsightRunnerInfo, type InsightRunnerOption, type InsightRunners } from "../shared/insights";
 import { redactSecrets } from "./insight-analysis";
 import { defaultModelOf, providerModelId } from "../shared/provider-model";
 
-export const BUILTIN_INSIGHT_RUNNER: InsightRunnerInfo = { kind: "grok", label: "Grok 4.7 · xhigh", provider: null, model: GROK_DEFAULT_MODEL, thinkingOptionId: GROK_DEFAULT_EFFORT, modeId: null, sessionAgentId: null };
-/** The built-in Grok CLI with its saved model and reasoning effort (grok-4.7 · xhigh when unset). */
-export function grokPlan(runner: Extract<InsightRunner, { kind: "grok" }>): InsightRunnerPlan {
-  const model = runner.model ?? GROK_DEFAULT_MODEL, effort = runner.effort ?? GROK_DEFAULT_EFFORT;
-  return { info: { ...BUILTIN_INSIGHT_RUNNER, label: grokRunnerLabel({ model, effort }), model, thinkingOptionId: effort }, model, effort, access: "none", featureValues: {} };
-}
+/** A queued job's runner until it is resolved: the chosen kind, nothing else known yet. */
+export const PENDING_RUNNER_INFO: InsightRunnerInfo = { kind: "auto", label: "", provider: null, model: null, thinkingOptionId: null, modeId: null, sessionAgentId: null };
 export let AUTO_RUNNER_LABEL = t("serverInsightRunner.m001");
-/** What the built-in runner really does (grok-runner.ts): no tools offered and every call refused; its session is deleted when the run ends. */
-export let GROK_RUNNER_DETAIL = t("serverInsightRunner.m002");
+/** What the built-in choice really does: Claude Code in plan mode with every tool denied (CLAUDE_LOCKDOWN_OPTIONS), archived when done. */
+export let CLAUDE_RUNNER_DETAIL = t("serverInsightRunner.m002");
 export let NO_RUNNER_ERROR = t("serverInsightRunner.m003");
 export let INSIGHT_PERMISSION_MESSAGE = t("serverInsightRunner.m004");
 /** Shown for `ask` access: only requests that need approval reach the observatory, so say so. */
@@ -28,11 +23,11 @@ let UNSAFE_REASON = t("serverInsightRunner.m007");
 let UNVERIFIED_MODE_ERROR = t("serverInsightRunner.m008");
 let WORKSPACE_ERROR = t("serverInsightRunner.m009");
 /**
- * What `auto` may run, in order: Codex (its read-only sandbox covers reads, shell and network), Claude Code (locked down,
- * see CLAUDE_LOCKDOWN_OPTIONS), then custom providers that extend them (`extends` in the daemon config). The Grok CLI is
- * never picked automatically: it sends the transcript to xAI, so it runs only when chosen by name.
+ * What `auto` may run, in order: Claude Code (locked down, see CLAUDE_LOCKDOWN_OPTIONS), Codex (read-only sandbox), then
+ * custom providers that extend them (`extends` in the daemon config). Claude Code replaces the Grok CLI this plugin used
+ * to prefer, which sent transcripts to xAI.
  */
-const AUTO_BASES = ["codex", "claude"] as const;
+const AUTO_BASES = ["claude", "codex"] as const;
 /**
  * Profile feature switches an analysis keeps: speed and reasoning effort only (Paseo 0.11: Claude Code / Oh My Pi `fast_mode`,
  * Cursor `fast`, Codex `service_tier`). Everything else (auto-accept, plan or agent switches, provider-specific access settings)
@@ -49,7 +44,7 @@ interface Catalog { entries: CatalogEntry[]; profiles: Profile[] }
 export interface InsightRunnerPlan { info: InsightRunnerInfo; model: string; effort: string | null; access: Access; featureValues: Record<string, unknown>; providerOptions?: Record<string, unknown>;
   /** MCP servers merged over the helper's own (Codex: Paseo's and the user's servers replaced by stubs that exit at once). */ mcpServers?: Record<string, Record<string, unknown>>;
   /** Claude-based helper: deny every tool the user's Claude settings pre-approve (allow rules are read when the helper starts). */ claudeLockdown?: true }
-export interface InsightRunnerRegistryOptions { now?: () => number; findBinary?: () => Promise<string | null>; cacheMs?: number;
+export interface InsightRunnerRegistryOptions { now?: () => number; cacheMs?: number;
   /** `~/.codex/config.toml` (or `$CODEX_HOME`), for the names of the user's MCP servers; injectable for tests. */ readCodexConfig?: () => Promise<string | null> }
 const clipped = (value: string | undefined | null, length: number) => value?.trim().slice(0, length) || null;
 const safeError = (value: unknown, length = 300) => redactSecrets(value instanceof Error ? value.message : String(value)).slice(0, length);
@@ -182,12 +177,10 @@ async function catalogRequest<T>(request: Promise<T>): Promise<T> {
 export class InsightRunnerRegistry {
   private readonly now: () => number;
   private readonly cacheMs: number;
-  private readonly findBinary: () => Promise<string | null>;
   private readonly readCodexConfig: () => Promise<string | null>;
   private catalogCache: { at: number; promise: Promise<Catalog>; textKey: string } | null = null;
-  private binaryCache: { at: number; promise: Promise<boolean> } | null = null;
   constructor(private readonly paseo: PaseoApi, options: InsightRunnerRegistryOptions = {}) {
-    this.now = options.now ?? Date.now; this.cacheMs = Math.max(60_000, options.cacheMs ?? 60_000); this.findBinary = options.findBinary ?? findGrokBinary;
+    this.now = options.now ?? Date.now; this.cacheMs = Math.max(60_000, options.cacheMs ?? 60_000);
     this.readCodexConfig = options.readCodexConfig ?? readCodexConfig;
   }
   private catalog(): Promise<Catalog> {
@@ -217,10 +210,6 @@ export class InsightRunnerRegistry {
     if (!first.entries.some(entry => entry.status === "loading") || typeof this.paseo.providers.waitForReady !== "function") return first;
     return this.paseo.providers.waitForReady({ timeoutMs: 8_000 }).catch(() => first);
   }
-  private binaryAvailable(): Promise<boolean> {
-    if (!this.binaryCache || this.now() - this.binaryCache.at >= this.cacheMs) this.binaryCache = { at: this.now(), promise: this.findBinary().then(Boolean).catch(() => false) };
-    return this.binaryCache.promise;
-  }
   private unavailable(entry: CatalogEntry | undefined): string | null {
     if (!entry) return t("serverInsightRunner.m012");
     if (!entry.enabled) return t("serverInsightRunner.m013");
@@ -231,7 +220,7 @@ export class InsightRunnerRegistry {
   }
   /**
    * What `auto` runs now: Codex, Claude Code, then a custom provider that extends one of them, each with its default model;
-   * within a rank, read-only modes come first. The Grok CLI (which sends the transcript to xAI) and other providers are never
+   * within a rank, read-only modes come first. Other providers are never
    * picked automatically. Null: nothing usable.
    */
   async autoRunner(): Promise<Exclude<InsightRunner, { kind: "auto" }> | null> {
@@ -252,7 +241,6 @@ export class InsightRunnerRegistry {
       if (!chosen) throw new Error(NO_RUNNER_ERROR);
       return this.resolve(chosen);
     }
-    if (runner.kind === "grok") return grokPlan(runner);
     const catalog = await this.catalog();
     const profile = runner.kind === "profile" ? catalog.profiles.find(candidate => candidate.id === runner.profileId) : undefined;
     if (runner.kind === "profile" && !profile) throw new Error(t("serverInsightRunner.m015"));
@@ -272,8 +260,14 @@ export class InsightRunnerRegistry {
       ...(mcpServers ? { mcpServers } : {}), ...(claude ? { claudeLockdown: true as const } : {}) };
   }
   async runners(): Promise<InsightRunners> {
-    const [catalog, available] = await Promise.all([this.catalog(), this.binaryAvailable()]);
-    const builtin: InsightRunnerOption = { runner: { kind: "grok" }, label: BUILTIN_INSIGHT_RUNNER.label, detail: GROK_RUNNER_DETAIL, providerLabel: "Grok", modelLabel: "Grok 4.7", thinkingLabel: "xhigh", available, reason: available ? null : t("serverInsightRunner.m017"), access: "none", modeId: null };
+    const catalog = await this.catalog();
+    // The built-in choice: Claude Code with its default model, locked down (plan mode, every tool denied).
+    const claudeEntry = catalog.entries.find(entry => entry.provider === CLAUDE_RUNNER.provider);
+    const claude = await this.resolve(structuredClone(CLAUDE_RUNNER) as InsightRunner).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+    const claudeModel = claude instanceof Error ? null : claudeEntry?.models.find(model => model.id === claude.info.model);
+    const builtin: InsightRunnerOption = { runner: structuredClone(CLAUDE_RUNNER) as InsightRunner, label: claudeEntry?.label ?? "Claude Code", detail: CLAUDE_RUNNER_DETAIL, providerLabel: claudeEntry?.label ?? "Claude Code",
+      modelLabel: claude instanceof Error ? null : claudeModel?.label ?? claude.info.model, thinkingLabel: claude instanceof Error ? null : claudeModel?.thinking.find(option => option.id === claude.effort)?.label ?? claude.effort,
+      available: !(claude instanceof Error), reason: claude instanceof Error ? clipped(this.unavailable(claudeEntry) ?? claude.message, 300) : null, access: claude instanceof Error ? "read" : claude.access, modeId: claude instanceof Error ? null : claude.info.modeId };
     const chosen = await this.resolve({ kind: "auto" }).catch(() => null);
     const auto: InsightRunnerOption = { runner: { kind: "auto" }, label: AUTO_RUNNER_LABEL, detail: t("serverInsightRunner.m018"),
       providerLabel: chosen ? t("serverInsightRunner.m019", { value1: chosen.info.label }) : null, modelLabel: null, thinkingLabel: null, available: !!chosen,
@@ -320,7 +314,7 @@ function snapshotUsage(snapshot: PaseoAgent | null): InsightJob["usage"] {
 /** Owns precisely one temporary handle, including its single structured-output retry. */
 export async function runPaseoStructured<T>(options: PaseoStructuredRunOptions<T>): Promise<PaseoStructuredResult<T>> {
   const { paseo, plan, parent, signal } = options;
-  if (plan.info.kind === "grok" || plan.info.kind === "auto" || !plan.info.provider) throw new Error(t("serverInsightRunner.m022"));
+  if (plan.info.kind === "auto" || plan.info.kind === "grok" || !plan.info.provider) throw new Error(t("serverInsightRunner.m022"));
   // Never create a helper whose mode is not pinned to a verified restricted one: without a mode it would inherit the analysed Agent's.
   if (!plan.info.modeId || (plan.access !== "read" && plan.access !== "ask")) throw new Error(UNVERIFIED_MODE_ERROR);
   if (signal.aborted) throw new Error(t("serverInsightRunner.m023"));
@@ -427,7 +421,7 @@ export async function cleanupInsightAgents(paseo: PaseoApi, ownedJobIds: Readonl
 // Refresh module-level display text when the selected language changes.
 onTextChange(() => {
   AUTO_RUNNER_LABEL = t("serverInsightRunner.m001");
-  GROK_RUNNER_DETAIL = t("serverInsightRunner.m002");
+  CLAUDE_RUNNER_DETAIL = t("serverInsightRunner.m002");
   NO_RUNNER_ERROR = t("serverInsightRunner.m003");
   INSIGHT_PERMISSION_MESSAGE = t("serverInsightRunner.m004");
   ASK_REASON = t("serverInsightRunner.m005");

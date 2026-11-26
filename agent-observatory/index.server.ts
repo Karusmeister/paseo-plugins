@@ -37,7 +37,6 @@ import { registerQuota } from "./server/quota";
 import { lifecycleHub, turnRead } from "./server/lifecycle-hub";
 import { hookTimeline } from "./server/turn-timeline";
 import { DeviceZone } from "./server/device-zone";
-import { scheduleInsightSweeps } from "./server/grok-runner";
 import { registerProfiles } from "./server/profiles";
 import { registerClientChunks } from "./server/ui-chunk";
 import { alertSettings, defaultAlertSettings, type AlertSettings } from "./shared/alerts";
@@ -111,10 +110,6 @@ export default function contribute(host: PluginServerContext) {
       return row ? { startedAt: row.turnStartedAt, endedAt: row.turnEndedAt } : null;
     },
     directoryAgents: () => directory,
-  });
-  // Grok analyses cut short by a reload or a restart leave their excerpt directory and Grok session behind (opus-F71).
-  const stopInsightSweeps = scheduleInsightSweeps(swept => {
-    if (swept.directories || swept.sessions || swept.indexed) console.log(t("serverLifecycle.cleanup", { directories: swept.directories, sessions: swept.sessions, indexed: swept.indexed, megabytes: (swept.bytes / 1048576).toFixed(1) }));
   });
   const removeHistory = registerHistory(server, bridge);
   // Telemetry checks 知道了 on a stop and the completion a 标记已读 receipt is for (opus-F34, codex-F5).
@@ -247,7 +242,6 @@ export default function contribute(host: PluginServerContext) {
     hub.close();
     analytics.close();
     removeHistory();
-    stopInsightSweeps();
     await Promise.all([removeInsights(), recaps.close(), readState.close(), preferences.close(), Promise.resolve(removeResults()), telemetry.close(), stats.close(), tokens.close(), removeDigest(), schedules.close(), background.close(), removeQuota(), resume.close(), zones.close(), labels.close()]);
     bridge.dispose();
   };

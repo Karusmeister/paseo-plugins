@@ -2,12 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { PluginHookAgent, PluginServerContext } from "@getpaseo/plugin/server";
 import { currentLanguage } from "../shared/i18n";
 import { t } from "../shared/text";
-import { GROK_DEFAULT_MODEL, grokRunnerLabel } from "../shared/insights";
-import { RECAP_DEFAULTS, RECAP_GROK_EFFORT, getRecapStatus, getRecaps, recapSettings, type RecapSettings, type RecapStatus, type RecapView } from "../shared/recap";
+import { RECAP_DEFAULTS, getRecapStatus, getRecaps, recapSettings, type RecapSettings, type RecapStatus, type RecapView } from "../shared/recap";
 import type { AgentTimelineItem, PaseoApi } from "./paseo-types";
 import { languageName } from "./locales";
-import { findGrokBinary, runGrokAnalysis } from "./grok-runner";
-import { InsightRunnerRegistry, runPaseoStructured, type InsightRunnerPlan } from "./insight-runner";
+import { AUTO_RUNNER_LABEL, InsightRunnerRegistry, runPaseoStructured, type InsightRunnerPlan } from "./insight-runner";
 import { isKnownInsightAgent, markInsightAgent } from "./insight-runner-lifecycle";
 import { redactSecrets } from "./insight-analysis";
 import { telemetryDirectory } from "./telemetry";
@@ -21,19 +19,19 @@ export const RECAP_QUIET_MS = 10_000;
 /** Recaps written at once, host-wide; the rest wait in a short queue (newest turn per Agent). */
 export const RECAP_CONCURRENCY = 2;
 const QUEUE_LIMIT = 16, MAX_AGENT_STATES = 2000;
-const GROK_TIMEOUT_MS = 2 * 60_000, PROVIDER_TIMEOUT_MS = 4 * 60_000, SNAPSHOT_TIMEOUT_MS = 8_000;
-/** No usable runner (no Grok CLI, a profile that cannot run): look again after this long. */
+const PROVIDER_TIMEOUT_MS = 4 * 60_000, SNAPSHOT_TIMEOUT_MS = 8_000;
+/** No usable runner (none enabled, a profile that cannot run): look again after this long. */
 const UNAVAILABLE_MS = 5 * 60_000;
 /** After a failed run new recaps pause 1, 2, 4 … minutes, at most 30; a written recap ends the pause. */
 const BACKOFF_BASE_MS = 60_000, BACKOFF_MAX_MS = 30 * 60_000;
-const BINARY_CACHE_MS = 5 * 60_000, SAVE_DELAY_MS = 1_000;
+const SAVE_DELAY_MS = 1_000;
 /**
- * A profile or another model writes through a temporary sub-agent the host keeps (archived; it cannot be deleted): such a run
- * starts at most once in this time per Agent, for its latest turn. The Grok CLI leaves nothing behind and has no such wait.
+ * Every runner writes through a temporary sub-agent the host keeps (archived; it cannot be deleted): such a run starts at
+ * most once in this time per Agent, for its latest turn.
  */
 export const RECAP_HELPER_COOLDOWN_MS = 30 * 60_000;
 
-type Problem = "grok" | "runner";
+type Problem = "runner";
 /** The chosen runner cannot run now: not a failure, recaps simply wait. */
 class RecapUnavailable extends Error { constructor(readonly problem: Problem, readonly reason: string | null) { super(problem); this.name = "RecapUnavailable"; } }
 interface Job { agentId: string; seq: number; prompt: string; paseo: PaseoApi; title: string | null }
@@ -49,17 +47,16 @@ interface AgentState {
   /** When a profile or another model last started a recap for it (0: never). */
   helperAt: number;
 }
-type Plan = { kind: "grok"; binary: string; model: string; effort: string; label: string } | { kind: "paseo"; plan: InsightRunnerPlan; label: string };
+type Plan = { plan: InsightRunnerPlan; label: string };
 export interface ObservedTurn { startedAt: string | null; endedAt: string | null }
 export interface RecapManagerOptions {
   directory?: string; now?: () => number; quietMs?: number; concurrency?: number; helperCooldownMs?: number;
-  findBinary?: () => Promise<string | null>; runGrok?: typeof runGrokAnalysis; runPaseo?: typeof runPaseoStructured;
+  runPaseo?: typeof runPaseoStructured;
   registry?: (paseo: PaseoApi) => Pick<InsightRunnerRegistry, "resolve">;
   /** When the plugin saw the Agent's latest turn start and end (the telemetry store); null when it holds no record. */
   observedTurn?: (agentId: string) => Promise<ObservedTurn | null>;
   /** The host's Agent directory as the stats walk last read it, to forget recaps of Agents archived or deleted since. */
   directoryAgents?: () => { loaded: boolean; truncated: boolean; refreshedAt: number; agents: ReadonlyArray<{ id: string; archivedAt: string | null }> };
-  /** The Grok CLI's home and temp root (tests). */ grokHome?: string; tmp?: string;
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -92,22 +89,19 @@ export class RecapManager {
   private readonly quietMs: number;
   private readonly helperCooldownMs: number;
   private readonly concurrency: number;
-  private readonly findBinary: () => Promise<string | null>;
-  private readonly runGrok: typeof runGrokAnalysis;
   private readonly runPaseo: typeof runPaseoStructured;
   private active = 0;
   private failures = 0;
   private backoffUntil = 0;
   private unavailable: { until: number; problem: Problem; reason: string | null } | null = null;
   private last: { at: number; outcome: "written" | "failed" | "skipped" } | null = null;
-  private binary: { at: number; value: Promise<string | null> } | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   readonly ready: Promise<void>;
   constructor(private readonly options: RecapManagerOptions = {}) {
     this.storage = new RecapStorage(options.directory ?? telemetryDirectory());
     this.now = options.now ?? Date.now; this.quietMs = options.quietMs ?? RECAP_QUIET_MS; this.helperCooldownMs = options.helperCooldownMs ?? RECAP_HELPER_COOLDOWN_MS; this.concurrency = Math.max(1, options.concurrency ?? RECAP_CONCURRENCY);
-    this.findBinary = options.findBinary ?? findGrokBinary; this.runGrok = options.runGrok ?? runGrokAnalysis; this.runPaseo = options.runPaseo ?? runPaseoStructured;
+    this.runPaseo = options.runPaseo ?? runPaseoStructured;
     this.ready = this.storage.load(this.now()).then(recaps => { this.recaps = new Map(recaps.map(recap => [recap.agentId, recap])); });
   }
 
@@ -191,14 +185,10 @@ export class RecapManager {
   async status(paseo?: PaseoApi): Promise<RecapStatus> {
     await this.ready;
     const now = this.now(), runner = this.settings.runner;
-    let label = this.grokLabel(), available = false, problem: RecapStatus["problem"] = null, reason: string | null = null;
-    if (runner.kind === "grok" || runner.kind === "auto") {
-      this.binary = null;
-      available = !!(await this.grokBinary());
-      if (!available) problem = "grok";
-    } else if (paseo) {
-      try { const plan = await this.registryOf(paseo).resolve(runner); label = plan.info.label; available = true; }
-      catch (error) { problem = "runner"; reason = redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 300); label = runner.kind === "profile" ? runner.profileId.slice(0, 160) : runner.provider.slice(0, 160); }
+    let label = this.savedLabel(), available = false, problem: RecapStatus["problem"] = null, reason: string | null = null;
+    if (paseo) {
+      try { const plan = await this.registryOf(paseo).resolve(runner); label = runner.kind === "auto" ? `${AUTO_RUNNER_LABEL} · ${plan.info.label}` : plan.info.label; available = true; }
+      catch (error) { problem = "runner"; reason = redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 300); }
     }
     if (available) this.unavailable = null;
     const pausing = available && now < this.backoffUntil;
@@ -238,10 +228,9 @@ export class RecapManager {
     // A job waiting out the cooldown is not under way: until then the Agent's recap simply stays out of date.
     return state?.running ? "generating" : state?.job && !this.cooldownLeft(state) ? "pending" : "idle";
   }
-  /** How long the Agent still waits before a profile or another model may write its recap (none with the Grok CLI). */
+  /** How long the Agent still waits before its next recap helper may start. */
   private cooldownLeft(state: AgentState): number {
-    const kind = this.settings.runner.kind;
-    return (kind === "profile" || kind === "provider") && state.helperAt ? Math.max(0, state.helperAt + this.helperCooldownMs - this.now()) : 0;
+    return state.helperAt ? Math.max(0, state.helperAt + this.helperCooldownMs - this.now()) : 0;
   }
   /** Its quiet wait or place in the queue ends; a run already started is the caller's to abort. */
   private drop(agentId: string, state: AgentState): void {
@@ -312,23 +301,15 @@ export class RecapManager {
       if (!current()) return;
       const turn = await (this.options.observedTurn?.(job.agentId) ?? Promise.resolve(null)).catch(() => null);
       const suggestions = () => this.settings.suggestions;
-      let parsed: ParsedRecap;
-      if (plan.kind === "grok") {
-        const output = await this.runGrok({ binary: plan.binary, prompt: job.prompt, signal, timeoutMs: GROK_TIMEOUT_MS, model: plan.model, effort: plan.effort, schema: recapOutputSchema,
-          systemPrompt: RECAP_SYSTEM_PROMPT, maxTurns: 3, ...(this.options.grokHome ? { grokHome: this.options.grokHome } : {}), ...(this.options.tmp ? { tmp: this.options.tmp } : {}) });
-        if (!current()) return;
-        parsed = parseRecapOutput(output, { suggestions: suggestions() });
-      } else {
-        const title = (snapshot.title || job.title || "").trim().slice(0, 40);
-        // The host keeps the sub-agent this starts: the Agent's next recap waits out the cooldown.
-        state.helperAt = this.now();
-        const result = await this.runPaseo<ParsedRecap>({ paseo: job.paseo, plan: plan.plan, parent: { id: job.agentId, cwd: snapshot.cwd, workspaceId: snapshot.workspaceId ?? null, archived: false, title },
-          jobId: `recap-${randomUUID()}`, title: t("serverRecap.helperTitle", { title }), prompt: job.prompt, systemPrompt: RECAP_SYSTEM_PROMPT, schema: recapOutputSchema,
-          parse: text => parseRecapOutput(text, { suggestions: suggestions() }), signal, timeoutMs: PROVIDER_TIMEOUT_MS, now: this.now,
-          onSession: runner => { if (runner.sessionAgentId) markInsightAgent(runner.sessionAgentId); } });
-        if (!current()) return;
-        parsed = result.value;
-      }
+      const title = (snapshot.title || job.title || "").trim().slice(0, 40);
+      // The host keeps the sub-agent this starts: the Agent's next recap waits out the cooldown.
+      state.helperAt = this.now();
+      const result = await this.runPaseo<ParsedRecap>({ paseo: job.paseo, plan: plan.plan, parent: { id: job.agentId, cwd: snapshot.cwd, workspaceId: snapshot.workspaceId ?? null, archived: false, title },
+        jobId: `recap-${randomUUID()}`, title: t("serverRecap.helperTitle", { title }), prompt: job.prompt, systemPrompt: RECAP_SYSTEM_PROMPT, schema: recapOutputSchema,
+        parse: text => parseRecapOutput(text, { suggestions: suggestions() }), signal, timeoutMs: PROVIDER_TIMEOUT_MS, now: this.now,
+        onSession: runner => { if (runner.sessionAgentId) markInsightAgent(runner.sessionAgentId); } });
+      if (!current()) return;
+      const parsed = result.value;
       this.recaps.delete(job.agentId);
       this.recaps.set(job.agentId, { agentId: job.agentId, summary: parsed.summary, next: parsed.next, reply: suggestions() ? parsed.reply : null, at: iso(this.now()),
         roundAt: turn?.startedAt ?? null, endedAt: turn?.endedAt ?? null, stale: false, runner: plan.label.slice(0, 160) });
@@ -346,29 +327,20 @@ export class RecapManager {
     }
   }
 
-  private grokLabel(): string {
+  /** The saved runner in words, before (or without) resolving it. */
+  private savedLabel(): string {
     const runner = this.settings.runner;
-    return grokRunnerLabel({ model: runner.kind === "grok" && runner.model ? runner.model : GROK_DEFAULT_MODEL, effort: runner.kind === "grok" && runner.effort ? runner.effort : RECAP_GROK_EFFORT });
-  }
-  private grokBinary(): Promise<string | null> {
-    if (!this.binary || this.now() - this.binary.at >= BINARY_CACHE_MS) this.binary = { at: this.now(), value: this.findBinary().catch(() => null) };
-    return this.binary.value;
+    return (runner.kind === "auto" ? AUTO_RUNNER_LABEL : runner.kind === "profile" ? runner.profileId : runner.provider).slice(0, 160);
   }
   private registryOf(paseo: PaseoApi): Pick<InsightRunnerRegistry, "resolve"> {
     let registry = this.registries.get(paseo);
     if (!registry) { registry = this.options.registry?.(paseo) ?? new InsightRunnerRegistry(paseo, { now: this.now }); this.registries.set(paseo, registry); }
     return registry;
   }
-  /** The run's runner: the Grok CLI (low effort unless set) or the profile or provider, which must be able to run now. */
+  /** The run's runner: auto (Claude Code, else Codex), Claude Code, a profile or a provider, which must be able to run now. */
   private async plan(paseo: PaseoApi): Promise<Plan> {
     const runner = this.settings.runner;
-    if (runner.kind === "grok" || runner.kind === "auto") {
-      const binary = await this.grokBinary();
-      if (!binary) throw new RecapUnavailable("grok", null);
-      const model = runner.kind === "grok" && runner.model ? runner.model : GROK_DEFAULT_MODEL, effort = runner.kind === "grok" && runner.effort ? runner.effort : RECAP_GROK_EFFORT;
-      return { kind: "grok", binary, model, effort, label: grokRunnerLabel({ model, effort }) };
-    }
-    try { const plan = await this.registryOf(paseo).resolve(runner); return { kind: "paseo", plan, label: plan.info.label }; }
+    try { const plan = await this.registryOf(paseo).resolve(runner); return { plan, label: plan.info.label }; }
     catch (error) { throw new RecapUnavailable("runner", redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 300)); }
   }
   private note(outcome: "written" | "failed" | "skipped"): void { this.last = { at: this.now(), outcome }; }

@@ -6,22 +6,20 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { useSettings } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useQueryClient } from "@tanstack/react-query";
-import { GROK_DEFAULT_MODEL, grokRunnerLabel, type InsightRunner } from "../shared/insights";
-import { RECAP_DEFAULTS, RECAP_GROK_EFFORT, recapSettings, type RecapSettings } from "../shared/recap";
+import type { InsightRunner } from "../shared/insights";
+import { RECAP_DEFAULTS, recapSettings, type RecapSettings } from "../shared/recap";
 import { Banner, Badge, Button, MetaLine, Skeleton, fontSize, gradient, hue, radius, relativeTime, space, withAlpha } from "./kit";
 import { PaneLabel, Switch } from "./ui";
-import { Choice, GrokOptions, OtherModel, sameRunner } from "./runner-choice";
+import { Choice, OtherModel, sameRunner } from "./runner-choice";
 import { useInsightRunners } from "./use-insight-overview";
 import { recapStatusQueryKey, useRecapStatus } from "./use-recaps";
 
-type GrokRunner = Extract<InsightRunner, { kind: "grok" }>;
-const grokOf = (runner: InsightRunner): GrokRunner => runner.kind === "grok" ? runner : { kind: "grok" };
-/** A recap's Grok runner as it runs: the default model at low effort unless set. */
-const recapGrokLabel = (runner: InsightRunner) => { const grok = grokOf(runner); return grokRunnerLabel({ model: grok.model ?? GROK_DEFAULT_MODEL, effort: grok.effort ?? RECAP_GROK_EFFORT }); };
+/** The saved runner in words until the server says what it resolves to. */
+const savedRunnerLabel = (runner: InsightRunner) => runner.kind === "auto" ? t("coreInsightSettings.default2") : runner.kind === "profile" ? runner.profileId : runner.provider;
 
 /**
  * 每轮小结 and 建议回复 in the settings (观测设置 and 分析设置 show the same section): both off on a new install, what turning
- * them on sends where, who writes recaps (the Grok CLI at low effort by default, a profile or another model) and whether it
+ * them on sends where, who writes recaps (chosen automatically by default: a locked-down Claude Code, else Codex; or Claude Code, a profile or another model) and whether it
  * can right now. Saved as the host setting `recap`, so every device and the server see one value.
  */
 export function RecapSettingsSection({ theme, open = true }: { theme: PluginTheme; open?: boolean }) {
@@ -41,10 +39,11 @@ export function RecapSettingsSection({ theme, open = true }: { theme: PluginThem
   };
   const choose = (runner: InsightRunner, label: string) => { void save({ runner }, t("recap.runnerSaved", { runner: label })); };
   const on = values.enabled, fuchsia = hue(theme, "fuchsia"), info = status.data;
-  const runnerLabel = info?.runner ?? (values.runner.kind === "grok" || values.runner.kind === "auto" ? recapGrokLabel(values.runner) : values.runner.kind === "profile" ? values.runner.profileId : values.runner.provider);
-  const problem = !on || !info ? null : info.problem === "grok" ? t("recap.problemGrok") : info.problem === "runner" ? t("recap.problemRunner", { reason: info.reason ?? "" })
+  const runnerLabel = info?.runner ?? savedRunnerLabel(values.runner);
+  const problem = !on || !info ? null : info.problem === "runner" ? t("recap.problemRunner", { reason: info.reason ?? "" })
     : info.problem === "backoff" ? t("recap.problemBackoff", { time: info.until ? new Date(info.until).toLocaleTimeString(currentLanguage(), { hour: "2-digit", minute: "2-digit", hour12: false }) : "" }) : null;
-  const data = runners.data, current = values.runner, helpers = current.kind === "profile" || current.kind === "provider";
+  // Every runner is now a temporary Paseo helper agent, so the note about what it leaves behind always applies.
+  const data = runners.data, current = values.runner, helpers = true;
   return <View testID="recap-settings" style={{ gap: space.sm }}>
     <PaneLabel theme={theme}>{t("recap.title")}</PaneLabel>
     {settings.status === "loading" ? <Skeleton theme={theme} rows={2} /> : null}
@@ -84,11 +83,10 @@ export function RecapSettingsSection({ theme, open = true }: { theme: PluginThem
         {runners.isPending ? <Skeleton theme={theme} rows={3} /> : null}
         {runners.error ? <Banner theme={theme} tone="danger" message={t("recap.runnersFailed", { error: runners.error.message })} action={{ label: t("recap.retry"), onPress: () => void runners.refetch() }} /> : null}
         {data ? <>
-          <Choice theme={theme} option={{ ...data.builtin, runner: grokOf(current), label: recapGrokLabel(current), thinkingLabel: grokOf(current).effort ?? RECAP_GROK_EFFORT, detail: t("recap.grokDetail") }} badge={t("recap.defaultBadge")}
-            selected={current.kind === "grok" || current.kind === "auto"} onPress={() => choose(grokOf(current), recapGrokLabel(current))} />
-          {(current.kind === "grok" || current.kind === "auto") && data.builtin.available ? <GrokOptions theme={theme} runner={grokOf(current)} busy={settings.saving} defaultEffort={RECAP_GROK_EFFORT} onSave={runner => choose(runner, recapGrokLabel(runner))} /> : null}
+          <Choice theme={theme} option={data.auto} badge={t("recap.defaultBadge")} selected={current.kind === "auto"} onPress={() => choose(data.auto.runner, data.auto.label)} />
+          <Choice theme={theme} option={data.builtin} selected={sameRunner(data.builtin.runner, current)} onPress={() => choose(data.builtin.runner, data.builtin.label)} />
           {data.profiles.map(option => <Choice key={JSON.stringify(option.runner)} theme={theme} option={option} selected={sameRunner(option.runner, current)} onPress={() => choose(option.runner, option.label)} />)}
-          {data.providers.length ? <OtherModel theme={theme} providers={data.providers} current={current.kind === "provider" ? current : undefined} busy={settings.saving}
+          {data.providers.length ? <OtherModel theme={theme} providers={data.providers} current={current.kind === "provider" && !sameRunner(data.builtin.runner, current) ? current : undefined} busy={settings.saving}
             onUse={runner => { const entry = data.providers.find(item => item.provider === runner.provider); choose(runner, t("recap.runnerModel", { provider: entry?.label ?? runner.provider, model: runner.model ?? "" })); }} /> : null}
         </> : null}
       </View> : null}

@@ -1,6 +1,5 @@
 // Development-only synthetic 智能分析 data: 总览 roll-up, one suggestion set, analysis runners. No host data is read.
 import { rawAgents } from "./fixtures";
-import { grokRunnerLabel } from "../shared/insights";
 
 const hour = 3_600_000, day = 24 * hour;
 const iso = ms => new Date(ms).toISOString();
@@ -49,7 +48,7 @@ export function fixtureReportJobs(now = Date.now()) {
       findings: item.findings.map(finding => ({ id: finding.id, severity: finding.severity, category: finding.category, title: finding.title, detail: details[finding.category], evidence: [], recommendation: "先定位根因，再调整做法；把验证范围和改动范围对齐。" })),
       strengths: ["任务拆分清晰"], nextActions: item.findings.length ? ["按建议调整后做一次增量跟进"] : [], limitations: ["这是开发预览模拟数据，未调用真实 AI 模型。"] },
     evidence: [], model: "grok-4.7", effort: "xhigh", usage: { inputTokens: 52_000, outputTokens: 12_000, costUsd: null }, error: null,
-    runner: { kind: "grok", label: "Grok 4.7 · xhigh", provider: null, model: "grok-4.7", thinkingOptionId: "xhigh", modeId: null, sessionAgentId: null },
+    runner: { kind: "provider", label: "Claude Code · claude · Opus 5.5 · high", provider: "claude", model: "claude-opus-5-5", thinkingOptionId: "high", modeId: "plan", sessionAgentId: null },
     findingFeedback: Object.fromEntries(item.findings.filter(finding => finding.status !== "open").map(finding => [finding.id, { status: finding.status, updatedAt: iso(item.at + hour) }])),
   }));
 }
@@ -65,7 +64,7 @@ function suggestionJob(now, days, extra = {}, scenario = null) {
     id: "fixture-suggestions-1", createdAt: iso(now - 40 * 60_000), updatedAt: iso(now - 35 * 60_000), status: "completed", trigger: "manual", stage: "建议已生成",
     window: { days, from: localDay(now - (days - 1) * day, 0), to: localDay(now, 0), reports: all.length, findings: all.reduce((sum, item) => sum + item.findings.length, 0), agents: new Set(all.map(item => item.agentId)).size,
       ...windowClock(scenario) },
-    runner: { kind: "grok", label: "Grok 4.7 · xhigh", provider: null, model: "grok-4.7", thinkingOptionId: "xhigh", modeId: null, sessionAgentId: null },
+    runner: { kind: "provider", label: "Claude Code · claude · Opus 5.5 · high", provider: "claude", model: "claude-opus-5-5", thinkingOptionId: "high", modeId: "plan", sessionAgentId: null },
     usage: { inputTokens: 48_200, outputTokens: 6_900, costUsd: null }, error: null, basis: all.map(item => item.jobId), evidence,
     feedback: fixtureSuggestionsState.feedback,
     report: {
@@ -151,7 +150,7 @@ export function fixtureOverview(days, offset, scenario, settings, runnerLabel) {
 
 export const fixtureRunners = {
   auto: { runner: { kind: "auto" }, label: "自动选择", detail: "有 Grok CLI 时用它；否则用已启用的 Claude Code 或 Codex（包括 extends 它们的自定义 Provider）和它的默认模型", providerLabel: "现在：Grok 4.7 · xhigh", modelLabel: null, thinkingLabel: null, available: true, reason: null, access: "none", modeId: null },
-  builtin: { runner: { kind: "grok" }, label: "Grok 4.7 · xhigh", detail: "Grok CLI：不提供工具，工具调用一律拒绝；会话和它的会话搜索记录在分析结束后立即删除", providerLabel: null, modelLabel: "grok-4.7", thinkingLabel: "xhigh", available: true, reason: null, access: "none", modeId: null },
+  builtin: { runner: { kind: "provider", provider: "claude", model: null, thinkingOptionId: null }, label: "Claude Code", detail: "使用默认模型的 Claude Code，在计划模式下运行，禁用全部工具（包括你预先批准的工具），不加载 MCP 服务器。分析结束后归档该辅助会话", providerLabel: "Claude Code", modelLabel: "Opus 5.5", thinkingLabel: "high", available: true, reason: null, access: "read", modeId: "plan" },
   profiles: [
     { runner: { kind: "profile", profileId: "daily" }, label: "日常 · Opus 5.5", detail: "常规问答、代码阅读、一般分析", providerLabel: "Claude Code", modelLabel: "Opus 5.5", thinkingLabel: "high", available: true, reason: "没有只读模式：需要审批的工具请求会被自动拒绝，不需要审批的操作（例如读取文件）仍可能执行", access: "ask", modeId: "default" },
     { runner: { kind: "profile", profileId: "implement" }, label: "实现 · 长程执行与交付", detail: "目标和验收明确的编码、重构、迁移", providerLabel: "Codex", modelLabel: "GPT-5 Codex", thinkingLabel: "high", available: true, reason: null, access: "read", modeId: "auto" },
@@ -181,8 +180,7 @@ export const fixtureProfiles = [
   { id: "implement", name: "实现 · 长程执行与交付", provider: "codex", model: "gpt-5-codex", modeId: "full-access", thinkingOptionId: "high" },
 ];
 export function runnerLabelFor(runner) {
-  if (!runner || runner.kind === "auto") return "自动选择 · Grok 4.7 · xhigh";
-  if (runner.kind === "grok") return grokRunnerLabel(runner);
+  if (!runner || runner.kind === "auto") return "自动选择 · Claude Code · Opus 5.5 · high";
   if (runner.kind === "profile") return fixtureRunners.profiles.find(item => item.runner.profileId === runner.profileId)?.label ?? `Profile ${runner.profileId}（不可用）`;
   const provider = fixtureRunners.providers.find(item => item.provider === runner.provider);
   const model = runner.model ? fixtureModels(runner.provider).models.find(item => item.id === runner.model)?.label ?? runner.model : "默认模型";

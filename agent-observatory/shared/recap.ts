@@ -12,14 +12,11 @@ import { foldFind } from "./timeline-find";
 
 /** How long a recap may be: what the model is asked for (characters for Chinese, Japanese and Korean, words otherwise), and what is kept. */
 export const RECAP_LIMITS = { summaryCharacters: 25, nextCharacters: 12, summaryWords: 20, nextWords: 8, summaryStored: 300, nextStored: 120, replyStored: 60 } as const;
-/** A recap's own default effort for the built-in Grok CLI: quick rather than deep (an analysis defaults to xhigh). */
-export const RECAP_GROK_EFFORT = "low";
-
 /**
  * The host setting `recap` (`$PASEO_HOME/plugin-settings/agent-observatory/recap.json`). `enabled`: write recaps (sends
  * conversation text to the chosen model); `suggestions`: also ask for the next message, shown as an AI-suggested reply;
- * `runner`: who writes them, the built-in Grok CLI (low effort unless set) or a profile or provider (a temporary sub-agent
- * per recap). `auto` is not offered here and runs as the Grok CLI.
+ * `runner`: who writes them, a temporary locked-down sub-agent per recap: `auto` (the default: Claude Code, else Codex),
+ * Claude Code, a profile or a provider/model. A `grok` runner saved by an earlier version reads as `auto`.
  */
 export const recapSettings = defineSettings({
   id: "recap",
@@ -28,11 +25,11 @@ export const recapSettings = defineSettings({
   schema: z.object({
     enabled: z.boolean().default(false),
     suggestions: z.boolean().default(false),
-    runner: insightRunnerSchema.default({ kind: "grok" }),
+    runner: insightRunnerSchema.default({ kind: "auto" }),
   }),
 });
 export type RecapSettings = z.output<typeof recapSettings.schema>;
-export const RECAP_DEFAULTS: RecapSettings = { enabled: false, suggestions: false, runner: { kind: "grok" } };
+export const RECAP_DEFAULTS: RecapSettings = { enabled: false, suggestions: false, runner: { kind: "auto" } };
 
 const id = z.string().min(1).max(256), revision = z.string().min(1).max(80), instant = z.iso.datetime().nullable();
 /**
@@ -67,7 +64,7 @@ export type RecapAnswer = z.infer<typeof getRecaps.output>;
 export type RecapList = Extract<RecapAnswer, { mode: "full" }>;
 
 /**
- * For the settings: who writes recaps and whether it can now. `problem`: `grok` (no Grok CLI found), `runner` (the chosen
+ * For the settings: who writes recaps and whether it can now. `problem`: `runner` (no usable runner, or the chosen
  * profile or provider cannot run; `reason` says why), `backoff` (recent runs failed: recaps pause until `until`).
  */
 export const getRecapStatus = defineRpc({
@@ -75,7 +72,7 @@ export const getRecapStatus = defineRpc({
   input: z.object({}),
   output: z.object({
     enabled: z.boolean(), suggestions: z.boolean(), runner: z.string().max(160), available: z.boolean(),
-    problem: z.enum(["grok", "runner", "backoff"]).nullable(), reason: z.string().max(300).nullable(), until: instant,
+    problem: z.enum(["runner", "backoff"]).nullable(), reason: z.string().max(300).nullable(), until: instant,
     active: z.number().int().nonnegative(), queued: z.number().int().nonnegative(),
     lastAt: instant, lastOutcome: z.enum(["written", "failed", "skipped"]).nullable(),
   }),

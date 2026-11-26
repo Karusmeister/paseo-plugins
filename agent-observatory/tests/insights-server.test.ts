@@ -11,28 +11,29 @@ import { isInsightAgent, isKnownInsightAgent } from "../server/insight-runner-li
 const defaults = { autoEnabled: true, minTurns: 4, minTools: 5, cooldownHours: 7 };
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), "observatory-insights-server-"));
-  const create = () => new InsightManager({ directory, findBinary: async () => null });
+  const create = () => new InsightManager({ directory });
   return { directory, create, remove: () => rm(directory, { recursive: true, force: true }) };
 }
-test("settings v1 disables automation exactly once and writes v2 with the built-in runner", async () => {
+test("settings v1 disables automation exactly once and writes v2 with the automatic runner", async () => {
   const f = await fixture(); let manager: InsightManager | undefined;
   try {
     await writeFile(join(f.directory, "insight-settings.json"), JSON.stringify({ version: 1, settings: defaults }));
     manager = f.create();
-    assert.deepEqual((await manager.state()).settings, { ...defaults, autoEnabled: false, runner: { kind: "grok" } });
+    assert.deepEqual((await manager.state()).settings, { ...defaults, autoEnabled: false, runner: { kind: "auto" } });
     assert.equal(JSON.parse(await readFile(join(f.directory, "insight-settings.json"), "utf8")).version, 2);
     await manager.configure({ autoEnabled: true, runner: { kind: "profile", profileId: "my-profile" } });
     await manager.close(); manager = f.create();
     assert.deepEqual((await manager.state()).settings, { ...defaults, runner: { kind: "profile", profileId: "my-profile" } });
   } finally { await manager?.close(); await f.remove(); }
 });
-test("a saved runner choice is kept as it is: an existing Grok setting stays Grok", async () => {
+test("a Grok runner saved by an earlier version reads as automatic, and Grok never runs", async () => {
   const f = await fixture(); let manager: InsightManager | undefined;
   try {
     await writeFile(join(f.directory, "insight-settings.json"), JSON.stringify({ version: 2, settings: { ...defaults, autoEnabled: false, runner: { kind: "grok" } } }));
     manager = f.create();
-    assert.deepEqual((await manager.state()).settings.runner, { kind: "grok" });
-    await assert.rejects(manager.start({} as PaseoApi, "agent-1"), /未找到 Grok CLI/);
+    assert.deepEqual((await manager.state()).settings.runner, { kind: "auto" });
+    // A host with no usable provider: nothing can run (there is no Grok CLI fallback any more).
+    await assert.rejects(manager.start({} as PaseoApi, "agent-1"), /没有可以自动选用的分析执行器/);
   } finally { await manager?.close(); await f.remove(); }
 });
 test("partial configuration keeps omitted fields and unchanged settings do not rewrite disk", async () => {

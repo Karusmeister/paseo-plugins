@@ -211,4 +211,3 @@ export function parseInsightText(output: string, references: Set<string>): { rep
   if (!isUsefulInsightReport(report)) throw new InsightReportError(t("serverInsightAnalysis.m024"), reportedUsage);
   return { report, usage: reportedUsage };
 }
-export const parseGrokReport = parseInsightText;

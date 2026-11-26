@@ -4,7 +4,7 @@ Pages: Agent Observatory, Archived sessions and Scheduled runs, plus workspace a
 
 ## Setup
 
-Requires Paseo 0.11.1+. AI reviews and turn summaries need the Grok CLI (signed in on the daemon host) or an enabled Paseo provider.
+Requires Paseo 0.11.1+. AI reviews and turn summaries need an enabled Paseo provider (Claude Code or Codex by default). This fork removed the Grok CLI runner, which sent transcripts to xAI.
 
 ## Languages
 
@@ -45,10 +45,10 @@ Some use daemon messages the plugin API lacks, over its own connection. It can o
 
 Nothing is reviewed until you start one; automatic reviews are off by default. A review sends a bounded session excerpt (prompts, replies, tool calls and output; at most 180 entries, about 120,000 characters) with project and agent metadata to the chosen model. Common credential formats are masked, not exhaustively. Suggestions send recent report summaries the same way.
 
-- Grok CLI: `grok` runs in a fresh temporary directory with every built-in tool removed, tool calls denied, web search, memory and session search off and no other providers' keys; the excerpt passes through a temporary file. Its directory, saved session and session-search record are deleted afterwards. It is the only subprocess the plugin starts.
-- A Paseo profile or provider: a temporary sub-agent of the reviewed agent in its workspace, in a read-only mode or Claude Code's Always Ask, where approvals are denied but actions needing none (reading files) still run, unmasked. It is archived afterwards; its conversation stays in the host's and provider's logs and uses that provider's quota.
-- Automatic choice (the default): the Grok CLI when found, otherwise an enabled Claude Code or Codex provider.
+- Claude Code (the built-in choice): a temporary sub-agent of the reviewed agent in its workspace, in plan mode with every built-in tool and Paseo's MCP server denied, every tool your Claude settings pre-approve (`permissions.allow`) denied by name, `--strict-mcp-config` and the shell sandbox on. It is archived afterwards; its conversation stays in the host's and provider's logs and uses that account's quota.
+- Another Paseo profile or provider: the same kind of sub-agent, in a verified read-only mode only (Codex's read-only sandbox with web search off and its MCP servers replaced by stubs, an Ask or Plan mode). Modes that merely ask before each tool are refused, since pre-approved tools run there without a prompt.
+- Automatic choice (the default): an enabled Claude Code, otherwise Codex, otherwise a custom provider that extends one of them.
 
-Turn summaries are off by default too. When on, 10 seconds after a top-level agent's turn ends, the runner (default: Grok CLI, low effort) reads that turn and up to 8 earlier ones (messages only, masked, at most 32 KB) and writes a one-line goal, progress and next step, optionally with a suggested reply. Turning them off deletes them.
+Turn summaries are off by default too. When on, 10 seconds after a top-level agent's turn ends, the runner (default: automatic choice) reads that turn and up to 8 earlier ones (messages only, masked, at most 32 KB) and writes a one-line goal, progress and next step, optionally with a suggested reply. Each summary is a temporary locked-down sub-agent, at most one per agent every 30 minutes. Turning them off deletes them.
 
 The scheduled runs page is modeled on the schedule-runs plugin by panrafal.

@@ -10,6 +10,7 @@ import type { InsightJob, InsightReport } from "../shared/insights";
 import { buildInsightOverview, getInsightWindow, localDayStart } from "../server/insight-overview";
 import { collectSuggestionContext } from "../server/insight-suggestions";
 import { InsightManager, registerInsights } from "../server/insights";
+import { fakeClaude } from "./fake-claude";
 import { InsightStorage } from "../server/insight-storage";
 import { statsZone } from "../server/stats-types";
 import { deviceZone } from "../server/analytics";
@@ -100,12 +101,12 @@ test("suggestion windows follow the device clock, by name alone too, and say whe
 const suggestion: SuggestionReport = { headline: "统一跨项目的验证入口", summary: "多个会话均可改进验证流程", themes: [],
   actions: [{ id: "action1", title: "补齐验证入口", why: "减少重复检查", steps: ["确认各项目的检查命令"], scope: "workflow", impact: "high", effort: "small",
     projects: [], evidence: ["R1#f1"], instruction: "完成变更后执行项目规定的验证命令，并报告结果。", task: null }], wins: [], watch: [] };
-const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi;
+const paseo = { agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }), ref: (id: string) => ({ refresh: async () => ({ agent: { id, cwd: "/repo", workspaceId: "workspace", title: id, archivedAt: null }, project: null }) }) } } as unknown as PaseoApi;
 async function manager(zone?: () => string | null) {
   const directory = await mkdtemp(join(tmpdir(), "insight-zone-")), storage = new InsightStorage(directory);
-  const settings = { autoEnabled: true, minTurns: 3, minTools: 3, cooldownHours: 6, runner: { kind: "grok" as const } };
+  const settings = { autoEnabled: true, minTurns: 3, minTools: 3, cooldownHours: 6, runner: { kind: "auto" as const } };
   await storage.saveSettings(settings); await storage.save({ settings, jobs: [job("old1", winter - 3_600_000), job("old2", winter - 7_200_000)], cooldowns: {}, activity: {}, revision: 1 }); await storage.close();
-  const instance = new InsightManager({ directory, now: () => winter, findBinary: async () => "/fake/grok", run: async () => JSON.stringify(suggestion), zone });
+  const instance = new InsightManager({ directory, now: () => winter, ...fakeClaude(async () => JSON.stringify(suggestion)), zone });
   return { instance, close: async () => { await instance.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 async function settled(instance: InsightManager, id: string): Promise<SuggestionJob> {

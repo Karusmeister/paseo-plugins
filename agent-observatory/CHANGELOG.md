@@ -2,6 +2,12 @@
 
 ## Unreleased (fork: security-hardening) · 2026-11-26
 
+**The Grok CLI runner is removed; Claude Code replaces it**
+- Analyses, suggestions and turn summaries no longer run the Grok CLI: the plugin no longer looks for a `grok` binary, starts it, or cleans `~/.grok` sessions and `/tmp/paseo-insight-*` at startup. Nothing is sent to xAI.
+- The built-in choice in 分析设置 and 每轮小结 is now Claude Code with its default model, locked down as below. `auto` picks Claude Code, then Codex, then providers that extend them. Turn summaries default to `auto` and, like every helper, run at most once per Agent every 30 minutes.
+- A `grok` runner saved by an earlier version reads as `auto`; old reports keep their Grok label. Token statistics still read Grok CLI usage logs if present (read-only, nothing sent).
+- `InsightManager` checks again, after resolving the runner, that it is still open and automation is still on before queuing work (the Grok binary probe used to sit there).
+
 **Analysis helpers can no longer act, even if a transcript prompt-injects them**
 - Claude Code (and providers that extend it) now run analyses in plan mode with every built-in tool and Paseo's MCP server denied, `--strict-mcp-config`, and the shell sandbox on. Every tool the user's or the workspace's Claude settings pre-approve (`permissions.allow`) is denied by name too: deny rules win over allow rules, so `Bash(...)`, `gh`, `git push` or MCP tools on the allowlist no longer run without a prompt. Before, the helper ran in Always Ask, where pre-approved tools ran unprompted and the auto-deny never saw them.
 - Codex keeps its read-only sandbox and now also has web search off, and Paseo's MCP server and the user's own `~/.codex/config.toml` MCP servers are replaced by stubs that exit at once (the sandbox does not cover MCP, and `approval_policy: never` would call them without asking).
