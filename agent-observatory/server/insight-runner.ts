@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { onTextChange, translator } from "../shared/i18n";
 import { t } from "../shared/text";
 import type { PaseoApi, PaseoAgent, PaseoAgentCreateOptions, PaseoAgentHandle, PaseoAgentRunResult, PaseoProviderSnapshotResult, AgentMode } from "./paseo-types";
@@ -24,8 +27,12 @@ let NO_MODES_REASON = t("serverInsightRunner.m006");
 let UNSAFE_REASON = t("serverInsightRunner.m007");
 let UNVERIFIED_MODE_ERROR = t("serverInsightRunner.m008");
 let WORKSPACE_ERROR = t("serverInsightRunner.m009");
-/** What `auto` may run, in order: Claude Code, Codex, then custom providers that extend them (`extends` in the daemon config). */
-const AUTO_BASES = ["claude", "codex"] as const;
+/**
+ * What `auto` may run, in order: Codex (its read-only sandbox covers reads, shell and network), Claude Code (locked down,
+ * see CLAUDE_LOCKDOWN_OPTIONS), then custom providers that extend them (`extends` in the daemon config). The Grok CLI is
+ * never picked automatically: it sends the transcript to xAI, so it runs only when chosen by name.
+ */
+const AUTO_BASES = ["codex", "claude"] as const;
 /**
  * Profile feature switches an analysis keeps: speed and reasoning effort only (Paseo 0.11: Claude Code / Oh My Pi `fast_mode`,
  * Cursor `fast`, Codex `service_tier`). Everything else (auto-accept, plan or agent switches, provider-specific access settings)
@@ -39,8 +46,11 @@ type Profile = NonNullable<Awaited<ReturnType<PaseoApi["config"]["get"]>>["confi
 interface CatalogEntry { provider: string; label: string; description: string | null; enabled: boolean; status: string; error: string | null; modes: AgentMode[]; models: InsightModelOption[];
   /** The built-in provider a custom one extends, from the daemon config. */ extends: string | null }
 interface Catalog { entries: CatalogEntry[]; profiles: Profile[] }
-export interface InsightRunnerPlan { info: InsightRunnerInfo; model: string; effort: string | null; access: Access; featureValues: Record<string, unknown>; providerOptions?: Record<string, unknown> }
-export interface InsightRunnerRegistryOptions { now?: () => number; findBinary?: () => Promise<string | null>; cacheMs?: number }
+export interface InsightRunnerPlan { info: InsightRunnerInfo; model: string; effort: string | null; access: Access; featureValues: Record<string, unknown>; providerOptions?: Record<string, unknown>;
+  /** MCP servers merged over the helper's own (Codex: Paseo's and the user's servers replaced by stubs that exit at once). */ mcpServers?: Record<string, Record<string, unknown>>;
+  /** Claude-based helper: deny every tool the user's Claude settings pre-approve (allow rules are read when the helper starts). */ claudeLockdown?: true }
+export interface InsightRunnerRegistryOptions { now?: () => number; findBinary?: () => Promise<string | null>; cacheMs?: number;
+  /** `~/.codex/config.toml` (or `$CODEX_HOME`), for the names of the user's MCP servers; injectable for tests. */ readCodexConfig?: () => Promise<string | null> }
 const clipped = (value: string | undefined | null, length: number) => value?.trim().slice(0, length) || null;
 const safeError = (value: unknown, length = 300) => redactSecrets(value instanceof Error ? value.message : String(value)).slice(0, length);
 const validId = (value: string | undefined, max: number) => value && value.length <= max ? value : null;
@@ -51,32 +61,97 @@ export function filterInsightFeatures(values: Record<string, unknown> = {}): Rec
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => (INSIGHT_FEATURES.has(key) && plain(value)) || (key === "auto_accept" && value === false)));
 }
 export interface InsightAnalysisMode { modeId: string | null; access: Access; providerOptions?: Record<string, unknown>; unsafe?: true }
-/** Codex's read-only sandbox, applied on top of its default mode (create_agent rejects modes a provider does not list). */
-export const CODEX_READ_ONLY_OPTIONS = { sandbox_mode: "read-only", approval_policy: "never" } as const;
+/**
+ * Codex's read-only sandbox, applied on top of its default mode (create_agent rejects modes a provider does not list), with
+ * web search off. The sandbox does not cover MCP servers: CODEX_PASEO_MCP_STUB and codexMcpStubs replace them.
+ */
+export const CODEX_READ_ONLY_OPTIONS = { sandbox_mode: "read-only", approval_policy: "never", web_search: "disabled" } as const;
+/**
+ * Claude Code's built-in tools plus Paseo's own MCP server. An analysis reads only its prompt, so it needs none of them.
+ * Plan mode alone is not enough: read-only tools and everything the user's `permissions.allow` pre-approves still run
+ * without a prompt, and the observatory's auto-deny only sees requests that ask. `disallowedTools` are deny rules, which
+ * win over allow rules; the user's own allow rules are added to them when the helper starts (claudeAllowedTools).
+ */
+export const CLAUDE_DISALLOWED_TOOLS = [
+  "Agent", "AskUserQuestion", "Bash", "BashOutput", "CronCreate", "CronDelete", "CronList", "Edit", "EnterPlanMode", "EnterWorktree",
+  "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "LSP", "ListAgents", "ListMcpResourcesTool", "Monitor", "MultiEdit",
+  "NotebookEdit", "NotebookRead", "PowerShell", "Read", "ReadMcpResourceDirTool", "ReadMcpResourceTool", "RemoteTrigger", "ReportFindings",
+  "ScheduleWakeup", "SendMessage", "Skill", "SlashCommand", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
+  "TaskUpdate", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch", "Workflow", "Write", "mcp__paseo",
+] as const;
+/** Plan mode, no tools, only the MCP servers Paseo passes (`--strict-mcp-config` drops the user's), shell sandboxed. */
+export const CLAUDE_LOCKDOWN_OPTIONS = {
+  disallowedTools: [...CLAUDE_DISALLOWED_TOOLS],
+  extraArgs: { "strict-mcp-config": null },
+  sandbox: { enabled: true, allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: false },
+} as const;
+/** Takes the place of Paseo's own MCP server (agents, schedules, terminals), which Paseo injects unless one named `paseo` exists. */
+export const CODEX_PASEO_MCP_STUB = { paseo: { type: "stdio", command: "/usr/bin/false", args: [] } } as const;
+const DEAD_MCP_URL = "http://127.0.0.1:9/mcp";
+/**
+ * Codex also loads the MCP servers in the user's `config.toml`, which its sandbox does not cover and which `approval_policy:
+ * never` would call without asking. A same-named entry in the helper's config replaces each one: an HTTP server gets an
+ * address nothing answers, a command server a command that exits at once. Only `[mcp_servers.<name>]` headers and whether
+ * each has a `url` are read.
+ */
+export function codexMcpStubs(configToml: string): Record<string, Record<string, unknown>> {
+  const stubs: Record<string, Record<string, unknown>> = {};
+  for (const section of configToml.split(/^(?=[ \t]*\[)/m)) {
+    const header = /^[ \t]*\[mcp_servers\.(?:"([^"]+)"|([A-Za-z0-9_-]+))\][ \t]*(?:#.*)?$/m.exec(section.split("\n", 1)[0] ?? "");
+    const name = header?.[1] ?? header?.[2];
+    if (!name) continue;
+    stubs[name] = /^[ \t]*url[ \t]*=/m.test(section) ? { type: "http", url: DEAD_MCP_URL } : { type: "stdio", command: "/usr/bin/false", args: [] };
+  }
+  return stubs;
+}
+async function readCodexConfig(): Promise<string | null> {
+  return readFile(join(process.env.CODEX_HOME || join(homedir(), ".codex"), "config.toml"), "utf8").catch(() => null);
+}
+/** The tool names in Claude allow rules (`Bash(git push:*)` gives `Bash`, `mcp__linear__save_issue` stays as it is). */
+export function claudeAllowRuleTools(settings: unknown): string[] {
+  const allow = (settings as { permissions?: { allow?: unknown } } | null)?.permissions?.allow;
+  if (!Array.isArray(allow)) return [];
+  return allow.flatMap(rule => {
+    if (typeof rule !== "string") return [];
+    const tool = rule.split("(", 1)[0]!.trim();
+    return /^[A-Za-z0-9_*:.-]{1,200}$/.test(tool) ? [tool] : [];
+  });
+}
+/** Every tool the user's and the workspace's Claude settings pre-approve, so the helper can deny them by name. */
+export async function claudeAllowedTools(cwd: string | null): Promise<string[]> {
+  const home = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const files = [join(home, "settings.json"), join(home, "settings.local.json"), ...(cwd ? [join(cwd, ".claude", "settings.json"), join(cwd, ".claude", "settings.local.json")] : [])];
+  const found = await Promise.all(files.map(file => readFile(file, "utf8").then(text => claudeAllowRuleTools(JSON.parse(text))).catch(() => [] as string[])));
+  return [...new Set(found.flat())];
+}
 /**
  * The mode an analysis runs in, always explicit (create_agent otherwise inherits the analysed Agent's mode, often
  * unattended, or maps an unattended parent to the target's unattended mode). Only modes whose restriction is known qualify:
- * - Codex and providers that extend it: the default mode in Codex's read-only sandbox without approvals (`read`);
+ * - Codex and providers that extend it: the default mode in Codex's read-only sandbox without approvals or web search (`read`);
+ * - Claude Code and providers that extend it: plan mode with every tool denied (CLAUDE_LOCKDOWN_OPTIONS) (`read`);
  * - an `ask` mode (Cursor's read-only Ask; Oh My Pi's Always Ask) (`read`);
- * - a `default` mode the provider marks as safe, Claude Code's Always Ask: every tool that needs approval asks (`ask`);
  * - a plan mode (`read`).
+ * Modes that only ask before each tool (Claude Code's Always Ask) are refused: what the user has pre-approved runs there
+ * without asking, so auto-denying prompts does not keep a prompt-injected analysis from acting.
  * A mode id alone proves nothing (an ACP agent's "default" or "agent" mode may edit without asking), and a provider with
  * no listed modes cannot be pinned to one: both are `unsafe` and never run.
  */
-export function insightAnalysisMode(modes: readonly AgentMode[], provider: { codex?: boolean } = {}): InsightAnalysisMode {
+export function insightAnalysisMode(modes: readonly AgentMode[], provider: { codex?: boolean; claude?: boolean } = {}): InsightAnalysisMode {
   const usable = modes.filter(mode => !(mode as AgentMode & { isUnattended?: boolean }).isUnattended && mode.colorTier !== "dangerous");
   if (provider.codex && usable.some(mode => mode.id === "auto")) return { modeId: "auto", access: "read", providerOptions: { ...CODEX_READ_ONLY_OPTIONS } };
+  if (provider.claude) {
+    if (usable.some(mode => mode.id === "plan")) return { modeId: "plan", access: "read", providerOptions: structuredClone(CLAUDE_LOCKDOWN_OPTIONS) as unknown as Record<string, unknown> };
+    return { modeId: null, access: "ask", unsafe: true };
+  }
   const ask = usable.find(mode => mode.id === "ask");
   if (ask) return { modeId: ask.id, access: "read" };
-  const gated = usable.find(mode => mode.id === "default" && mode.colorTier === "safe");
-  if (gated) return { modeId: gated.id, access: "ask" };
   const plan = usable.find(mode => mode.id === "plan" || mode.colorTier === "planning");
   if (plan) return { modeId: plan.id, access: "read" };
   return { modeId: null, access: "ask", unsafe: true };
 }
 /** The built-ins a provider is or extends (custom providers name theirs in `extends`). */
 const lineage = (entry: Pick<CatalogEntry, "provider" | "extends">) => [entry.provider, entry.extends].filter((id): id is string => !!id);
-const analysisModeOf = (entry: CatalogEntry) => insightAnalysisMode(entry.modes, { codex: lineage(entry).includes("codex") });
+const analysisModeOf = (entry: CatalogEntry) => insightAnalysisMode(entry.modes, { codex: lineage(entry).includes("codex"), claude: lineage(entry).includes("claude") });
 /** An analysis never auto-accepts: ACP and OpenCode clients otherwise switch it on for children of unattended Agents. */
 const lockedFeatures = (entry: CatalogEntry): Record<string, unknown> => lineage(entry).some(id => AUTO_ACCEPT_BASES.has(id)) ? { auto_accept: false } : {};
 
@@ -108,10 +183,12 @@ export class InsightRunnerRegistry {
   private readonly now: () => number;
   private readonly cacheMs: number;
   private readonly findBinary: () => Promise<string | null>;
+  private readonly readCodexConfig: () => Promise<string | null>;
   private catalogCache: { at: number; promise: Promise<Catalog>; textKey: string } | null = null;
   private binaryCache: { at: number; promise: Promise<boolean> } | null = null;
   constructor(private readonly paseo: PaseoApi, options: InsightRunnerRegistryOptions = {}) {
     this.now = options.now ?? Date.now; this.cacheMs = Math.max(60_000, options.cacheMs ?? 60_000); this.findBinary = options.findBinary ?? findGrokBinary;
+    this.readCodexConfig = options.readCodexConfig ?? readCodexConfig;
   }
   private catalog(): Promise<Catalog> {
     const textKey = `${translator().language}:${translator().hash}`;
@@ -153,12 +230,11 @@ export class InsightRunnerRegistry {
     return null;
   }
   /**
-   * What `auto` runs now: the Grok CLI when it is installed (no tools; its session is deleted after each run), else Claude Code, Codex, then a
-   * custom provider that extends one of them, each with its default model; within a rank, read-only modes come first.
-   * Other providers are never picked automatically. Null: nothing usable.
+   * What `auto` runs now: Codex, Claude Code, then a custom provider that extends one of them, each with its default model;
+   * within a rank, read-only modes come first. The Grok CLI (which sends the transcript to xAI) and other providers are never
+   * picked automatically. Null: nothing usable.
    */
   async autoRunner(): Promise<Exclude<InsightRunner, { kind: "auto" }> | null> {
-    if (await this.binaryAvailable()) return { kind: "grok" };
     const rank = (entry: CatalogEntry) => {
       const own = AUTO_BASES.indexOf(entry.provider as typeof AUTO_BASES[number]);
       if (own >= 0) return own;
@@ -190,7 +266,10 @@ export class InsightRunnerRegistry {
     const thinkingLabel = model?.thinking.find(option => option.id === thinkingOptionId)?.label ?? thinkingOptionId;
     const { modeId, access, providerOptions } = analysisModeOf(entry);
     const label = runner.kind === "profile" ? profile!.name : [entry.label, entry.label.includes(provider) ? null : provider, model?.label ?? modelId, thinkingLabel].filter(Boolean).join(" · ");
-    return { info: { kind: runner.kind, label: clipped(label, 160) ?? provider, provider, model: modelId, thinkingOptionId, modeId, sessionAgentId: null }, model: modelId ?? provider, effort: thinkingOptionId, access, featureValues: { ...filterInsightFeatures(profile?.featureValues), ...lockedFeatures(entry) }, ...(providerOptions ? { providerOptions } : {}) };
+    const codex = lineage(entry).includes("codex") && modeId === "auto", claude = !codex && lineage(entry).includes("claude");
+    const mcpServers = codex ? { ...codexMcpStubs((await this.readCodexConfig().catch(() => null)) ?? ""), ...structuredClone(CODEX_PASEO_MCP_STUB) } : undefined;
+    return { info: { kind: runner.kind, label: clipped(label, 160) ?? provider, provider, model: modelId, thinkingOptionId, modeId, sessionAgentId: null }, model: modelId ?? provider, effort: thinkingOptionId, access, featureValues: { ...filterInsightFeatures(profile?.featureValues), ...lockedFeatures(entry) }, ...(providerOptions ? { providerOptions } : {}),
+      ...(mcpServers ? { mcpServers } : {}), ...(claude ? { claudeLockdown: true as const } : {}) };
   }
   async runners(): Promise<InsightRunners> {
     const [catalog, available] = await Promise.all([this.catalog(), this.binaryAvailable()]);
@@ -277,9 +356,18 @@ export async function runPaseoStructured<T>(options: PaseoStructuredRunOptions<T
   };
   try {
     remaining();
+    // A Claude-based helper denies, by name, every tool the user's or the workspace's settings pre-approve.
+    let providerOptions = plan.providerOptions;
+    if (plan.claudeLockdown) {
+      const base = providerOptions as { disallowedTools?: unknown } | undefined;
+      if (!Array.isArray(base?.disallowedTools)) throw new Error(UNVERIFIED_MODE_ERROR);
+      const allowed = await guarded(claudeAllowedTools(parent.cwd));
+      providerOptions = { ...providerOptions, disallowedTools: [...new Set([...(base!.disallowedTools as string[]), ...allowed])] };
+    }
     const config: PaseoAgentCreateOptions["config"] = { provider: providerModelId(plan.info.provider, plan.info.model),
       modeId: plan.info.modeId, ...(plan.info.thinkingOptionId ? { thinkingOptionId: plan.info.thinkingOptionId } : {}), featureValues: filterInsightFeatures(plan.featureValues),
-      ...(plan.providerOptions ? { options: plan.providerOptions as NonNullable<PaseoAgentCreateOptions["config"]["options"]> } : {}), systemPrompt: options.systemPrompt };
+      ...(providerOptions ? { options: providerOptions as NonNullable<PaseoAgentCreateOptions["config"]["options"]> } : {}),
+      ...(plan.mcpServers ? { mcpServers: plan.mcpServers as NonNullable<PaseoAgentCreateOptions["config"]["mcpServers"]> } : {}), systemPrompt: options.systemPrompt };
     const common = { config, title: (options.title ?? t("serverInsightRunner.m033", { value1: parent.title })).slice(0, 60), prompt: options.prompt, outputSchema: z.toJSONSchema(options.schema), labels: { "observatory.role": "insight", "observatory.job": options.jobId } };
     let creation: Promise<PaseoAgentHandle>;
     if (parent.archived) {

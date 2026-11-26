@@ -28,6 +28,8 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 async function fixture(options: InsightManagerOptions = {}) {
   const directory = await mkdtemp(join(tmpdir(), "observatory-insight-test-"));
   const manager = new InsightManager({ directory, findBinary: async () => "/fake/grok", fetch: async () => trajectory(), run: async () => output(), ...options });
+  // These tests drive the Grok CLI path: `auto` no longer picks Grok, so choose it by name as a user would.
+  await manager.configure({ runner: { kind: "grok" } });
   return { directory, manager, async close() { await manager.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 async function waitFor(manager: InsightManager, id: string, status: InsightJob["status"]) {

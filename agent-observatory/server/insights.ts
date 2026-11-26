@@ -119,13 +119,14 @@ export class InsightManager {
     return device ? { timeZone: device } : null;
   }
   private async available() {
-    if (this.settings.runner.kind === "grok" || (this.settings.runner.kind === "auto" && this.binary)) return !!this.binary;
+    // `auto` never runs the Grok CLI (insight-runner.ts AUTO_BASES): it resolves to Codex or a locked-down Claude Code.
+    if (this.settings.runner.kind === "grok") return !!this.binary;
     if (!this.lastPaseo) return false;
     try { await this.registry(this.lastPaseo).resolve(this.settings.runner); return true; } catch { return false; }
   }
   private async runnerLabel(paseo = this.lastPaseo) {
     const runner = this.settings.runner;
-    if (runner.kind === "grok" || (runner.kind === "auto" && this.binary)) return runner.kind === "auto" ? `${AUTO_RUNNER_LABEL} · ${BUILTIN_INSIGHT_RUNNER.label}` : grokRunnerLabel(runner);
+    if (runner.kind === "grok") return grokRunnerLabel(runner);
     try {
       if (paseo) { const label = (await this.registry(paseo).resolve(runner)).info.label; return (runner.kind === "auto" ? `${AUTO_RUNNER_LABEL} · ${label}` : label).slice(0, 160); }
     } catch { /* preserve the configured identity when unavailable */ }
@@ -233,7 +234,7 @@ export class InsightManager {
     if (this.jobs.some(job => job.agentId === agentId && ACTIVE.has(job.status))) return this.start(paseo, agentId, trigger, question, mode, runner);
     const selection = runner ?? this.settings.runner;
     if (selection.kind === "grok" && !this.binary) throw new Error(t("serverInsights.m020"));
-    if (selection.kind === "auto" && !this.binary) await this.registry(paseo).resolve(selection).catch(error => { throw error instanceof Error && error.message === NO_RUNNER_ERROR ? error : new Error(t("serverInsights.m021", { NO_RUNNER_ERROR: NO_RUNNER_ERROR, value2: error instanceof Error ? error.message : String(error) })); });
+    if (selection.kind === "auto") await this.registry(paseo).resolve(selection).catch(error => { throw error instanceof Error && error.message === NO_RUNNER_ERROR ? error : new Error(t("serverInsights.m021", { NO_RUNNER_ERROR: NO_RUNNER_ERROR, value2: error instanceof Error ? error.message : String(error) })); });
     if (this.queue.length >= 8) throw new Error(t("serverInsights.m022"));
     const job = this.newJob(agentId, trigger, selection); this.jobs.unshift(job); this.enqueue({ kind: "report", id: job.id, paseo, question, mode, runner }, trigger); this.changed(); this.kick();
     return structuredClone(job);

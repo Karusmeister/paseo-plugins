@@ -142,7 +142,7 @@ test("configured Paseo report runs without Grok and records resolved runner plus
     // Made in the parent's workspace with the sub-agent label (0.13 escapes a `parent` create's first message).
     assert.equal(fake.creations[0].workspaceId, "workspace"); assert.equal(fake.creations[0].labels["paseo.parent-agent-id"], "target");
     assert.equal(fake.creations[0].parent, undefined); assert.equal(fake.creations[0].config.provider, "codex-fake/m");
-    assert.equal(fake.creations[0].config.modeId, "auto"); assert.deepEqual(fake.creations[0].config.options, { sandbox_mode: "read-only", approval_policy: "never" });
+    assert.equal(fake.creations[0].config.modeId, "auto"); assert.deepEqual(fake.creations[0].config.options, { sandbox_mode: "read-only", approval_policy: "never", web_search: "disabled" });
     assert.equal((await f.manager.list()).runnerLabel, "Reader"); assert.equal((await f.manager.list()).available, true);
   } finally { await f.close(); }
 });

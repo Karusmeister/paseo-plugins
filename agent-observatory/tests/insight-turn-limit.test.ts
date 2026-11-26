@@ -38,6 +38,8 @@ async function fixture(options: InsightManagerOptions = {}, seeded: InsightJob[]
     await storage.saveSettings(settings); await storage.save({ settings, jobs: seeded, cooldowns: {}, activity: {}, revision: 1 }); await storage.close();
   }
   const manager = new InsightManager({ directory, findBinary: async () => "/fake/grok", fetch: async () => trajectory(), run: async () => output(), ...options });
+  // These tests drive the Grok CLI path: `auto` no longer picks Grok, so choose it by name as a user would.
+  await manager.configure({ runner: { kind: "grok" } });
   return { manager, async close() { await manager.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 async function until<T>(read: () => Promise<T | null | undefined>, done: (value: T) => boolean): Promise<T> {

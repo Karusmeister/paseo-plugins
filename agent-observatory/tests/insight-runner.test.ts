@@ -3,9 +3,12 @@ import test from "node:test";
 import type { PaseoApi, PaseoAgent, PaseoAgentHandle, PaseoAgentRunResult, PaseoAgentCreateOptions } from "@getpaseo/client";
 import type { AgentMode } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { listInsightModels, listInsightRunners } from "../shared/insights";
 import { extractInsightJson } from "../server/insight-analysis";
-import { BUILTIN_INSIGHT_RUNNER, INSIGHT_PERMISSION_MESSAGE, InsightRunnerRegistry, NO_RUNNER_ERROR, cleanupInsightAgents, filterInsightFeatures, insightAnalysisMode, isInsightAgent, runPaseoStructured, type InsightRunnerPlan, type PaseoStructuredRunOptions } from "../server/insight-runner";
+import { BUILTIN_INSIGHT_RUNNER, CLAUDE_DISALLOWED_TOOLS, CLAUDE_LOCKDOWN_OPTIONS, CODEX_PASEO_MCP_STUB, INSIGHT_PERMISSION_MESSAGE, InsightRunnerRegistry, NO_RUNNER_ERROR, claudeAllowRuleTools, cleanupInsightAgents, codexMcpStubs, filterInsightFeatures, insightAnalysisMode, isInsightAgent, runPaseoStructured, type InsightRunnerPlan, type PaseoStructuredRunOptions } from "../server/insight-runner";
 
 const mode = (id: string, extra: Record<string, unknown> = {}): AgentMode => ({ id, label: id, ...extra });
 const entry = (provider: string, extra: Record<string, unknown> = {}) => ({ provider, label: provider, status: "ready", enabled: true, modes: [mode("ask")], models: [], ...extra });
@@ -13,29 +16,53 @@ function catalogFixture(entries: unknown[], profiles: unknown[] = [], extra: Rec
   let now = 0, configs = 0, snapshots = 0, binaries = 0;
   const argumentsSeen: unknown[][] = [];
   const paseo = { config: { get: async () => { configs++; return { config: { providers: configProviders, agentProfiles: profiles } }; } }, providers: { snapshot: async (...args: unknown[]) => { snapshots++; argumentsSeen.push(args); return { entries, ...extra }; } } } as unknown as PaseoApi;
-  const registry = new InsightRunnerRegistry(paseo, { now: () => now, cacheMs: 1, findBinary: async () => { binaries++; return "/fake/grok"; } });
+  const registry = new InsightRunnerRegistry(paseo, { now: () => now, cacheMs: 1, findBinary: async () => { binaries++; return "/fake/grok"; }, readCodexConfig: async () => null });
   return { registry, argumentsSeen, tick(value: number) { now = value; }, counts: () => ({ configs, snapshots, binaries }) };
 }
 
-test("runner mode selection only accepts modes that are read-only or ask before every tool", () => {
+const READ_ONLY_CODEX = { sandbox_mode: "read-only", approval_policy: "never", web_search: "disabled" };
+const claudeCodeModes = [mode("plan", { colorTier: "planning" }), mode("default", { colorTier: "safe" }), mode("acceptEdits", { colorTier: "moderate" }), mode("auto", { colorTier: "moderate" }), mode("bypassPermissions", { colorTier: "dangerous", isUnattended: true })];
+
+test("runner mode selection only accepts read-only modes, never ones that merely ask before each tool", () => {
   const cases: Array<[AgentMode[], string | null, string]> = [
-    [[mode("plan")], "plan", "read"], [[mode("ask")], "ask", "read"], [[mode("default", { colorTier: "safe" })], "default", "ask"],
-    [[mode("default", { colorTier: "safe" }), mode("ask")], "ask", "read"], [[mode("ask", { isUnattended: true }), mode("default", { colorTier: "safe" })], "default", "ask"],
+    [[mode("plan")], "plan", "read"], [[mode("ask")], "ask", "read"],
+    [[mode("default", { colorTier: "safe" }), mode("ask")], "ask", "read"],
     [[mode("ask", { colorTier: "dangerous" }), mode("plan")], "plan", "read"],
-    // Claude Code: plan, Always Ask (safe), accept edits, auto, bypass.
-    [[mode("plan", { colorTier: "planning" }), mode("default", { colorTier: "safe" }), mode("acceptEdits", { colorTier: "moderate" }), mode("auto", { colorTier: "moderate" }), mode("bypassPermissions", { colorTier: "dangerous", isUnattended: true })], "default", "ask"],
+    // Claude Code's modes from a provider that is not Claude-based: its plan mode, never Always Ask.
+    [claudeCodeModes, "plan", "read"],
     // ACP agents list modes without tiers: a "default" or "agent" mode may edit without asking, so their plan mode is used.
     [[mode("agent"), mode("plan")], "plan", "read"], [[mode("default"), mode("plan"), mode("auto"), mode("yolo")], "plan", "read"], [[mode("build", { colorTier: "moderate" }), mode("plan", { colorTier: "planning" })], "plan", "read"],
   ];
   for (const [modes, modeId, access] of cases) assert.deepEqual(insightAnalysisMode(modes), { modeId, access }, JSON.stringify(modes));
   // Codex and providers that extend it: create_agent rejects its unlisted read-only preset, so the default mode runs in a read-only sandbox without approvals.
   const codexModes = [mode("auto", { colorTier: "moderate" }), mode("auto-review", { colorTier: "moderate" }), mode("full-access", { colorTier: "dangerous", isUnattended: true })];
-  assert.deepEqual(insightAnalysisMode(codexModes, { codex: true }), { modeId: "auto", access: "read", providerOptions: { sandbox_mode: "read-only", approval_policy: "never" } });
+  assert.deepEqual(insightAnalysisMode(codexModes, { codex: true }), { modeId: "auto", access: "read", providerOptions: READ_ONLY_CODEX });
   // The same mode ids from another provider prove nothing: Codex's sandbox options are only sent to Codex.
   assert.deepEqual(insightAnalysisMode(codexModes), { modeId: null, access: "ask", unsafe: true });
   // No listed modes: create_agent would inherit the analysed Agent's mode (often unattended), so it is refused.
   assert.deepEqual(insightAnalysisMode([]), { modeId: null, access: "ask", unsafe: true });
   for (const modes of [[mode("yolo", { isUnattended: true })], [mode("default")], [mode("agent"), mode("auto")]]) assert.deepEqual(insightAnalysisMode(modes), { modeId: null, access: "ask", unsafe: true });
+  // Ask-before-each-tool modes are refused: pre-approved tools run there without asking, so auto-denying prompts is not enough.
+  for (const modes of [[mode("default", { colorTier: "safe" })], [mode("ask", { isUnattended: true }), mode("default", { colorTier: "safe" })]]) assert.deepEqual(insightAnalysisMode(modes), { modeId: null, access: "ask", unsafe: true });
+});
+
+test("a Claude-based helper runs in plan mode with every tool denied, or not at all", () => {
+  const locked = insightAnalysisMode(claudeCodeModes, { claude: true });
+  assert.deepEqual(locked, { modeId: "plan", access: "read", providerOptions: { disallowedTools: [...CLAUDE_DISALLOWED_TOOLS], extraArgs: { "strict-mcp-config": null }, sandbox: { enabled: true, allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: false } } });
+  for (const tool of ["Bash", "Read", "WebFetch", "Skill", "Agent", "mcp__paseo"]) assert.ok((locked.providerOptions!.disallowedTools as string[]).includes(tool), tool);
+  // Each call gets its own copy, so a merge into one helper's options cannot leak into the shared constant.
+  (locked.providerOptions!.disallowedTools as string[]).push("x"); assert.equal(CLAUDE_LOCKDOWN_OPTIONS.disallowedTools.includes("x" as never), false);
+  // Without a plan mode there is no verified restriction: Always Ask alone is refused.
+  assert.deepEqual(insightAnalysisMode([mode("default", { colorTier: "safe" }), mode("acceptEdits")], { claude: true }), { modeId: null, access: "ask", unsafe: true });
+});
+
+test("allow rules become tool names to deny, and Codex MCP servers become dead stubs", () => {
+  assert.deepEqual(claudeAllowRuleTools({ permissions: { allow: ["Bash(git push:*)", "WebFetch(domain:linear.app)", "mcp__claude_ai_Linear__save_issue", "Read", 7, "bad tool(x)", ""] } }),
+    ["Bash", "WebFetch", "mcp__claude_ai_Linear__save_issue", "Read"]);
+  assert.deepEqual(claudeAllowRuleTools(null), []); assert.deepEqual(claudeAllowRuleTools({ permissions: { allow: "Bash" } }), []);
+  const toml = '[model]\nname = "x"\n[mcp_servers.github]\ncommand = "gh-mcp"\n[mcp_servers."notion-db"]\nurl = "https://mcp.notion.com"\n[mcp_servers.github.env]\nTOKEN = "y"\n';
+  assert.deepEqual(codexMcpStubs(toml), { github: { type: "stdio", command: "/usr/bin/false", args: [] }, "notion-db": { type: "http", url: "http://127.0.0.1:9/mcp" } });
+  assert.deepEqual(codexMcpStubs(""), {});
 });
 
 test("runner features are an allowlist: speed and reasoning switches stay, anything that grants access does not", () => {
@@ -52,7 +79,7 @@ test("runner registry resolves profiles and defaults and shares a minimum sixty-
     [{ id: "p", name: "Reviewer", provider: "custom", modeId: "full-access", notes: "a".repeat(500), featureValues: { fast_mode: true, yolo: true } }], {}, { custom: { extends: "codex" } });
   assert.deepEqual((await f.registry.resolve({ kind: "grok" })).info, BUILTIN_INSIGHT_RUNNER); assert.deepEqual(f.counts(), { configs: 0, snapshots: 0, binaries: 0 });
   const [profile, direct, runners, models] = await Promise.all([f.registry.resolve({ kind: "profile", profileId: "p" }), f.registry.resolve({ kind: "provider", provider: "custom", model: null, thinkingOptionId: null }), f.registry.runners(), f.registry.models("custom")]);
-  assert.equal(profile.info.label, "Reviewer"); assert.equal(profile.info.modeId, "auto"); assert.deepEqual(profile.providerOptions, { sandbox_mode: "read-only", approval_policy: "never" }); assert.equal(profile.model, "m"); assert.equal(profile.effort, "high"); assert.deepEqual(profile.featureValues, { fast_mode: true });
+  assert.equal(profile.info.label, "Reviewer"); assert.equal(profile.info.modeId, "auto"); assert.deepEqual(profile.providerOptions, READ_ONLY_CODEX); assert.deepEqual(profile.mcpServers, CODEX_PASEO_MCP_STUB); assert.equal(profile.claudeLockdown, undefined); assert.equal(profile.model, "m"); assert.equal(profile.effort, "high"); assert.deepEqual(profile.featureValues, { fast_mode: true });
   assert.equal(direct.info.label, "Codex · custom · Model M · High"); assert.equal(runners.profiles[0].detail?.length, 400); assert.equal(runners.profiles[0].thinkingLabel, "High");
   assert.ok(listInsightRunners.output.safeParse(runners).success); assert.ok(listInsightModels.output.safeParse(models).success);
   assert.deepEqual(f.counts(), { configs: 1, snapshots: 1, binaries: 1 }); assert.deepEqual(f.argumentsSeen, [[]]);
@@ -60,31 +87,40 @@ test("runner registry resolves profiles and defaults and shares a minimum sixty-
   f.tick(60_000); await f.registry.runners(); assert.deepEqual(f.counts(), { configs: 2, snapshots: 2, binaries: 2 });
 });
 
-test("auto runs the Grok CLI when it is installed, otherwise Claude Code, Codex, then providers that extend them", async () => {
-  const withGrok = catalogFixture([entry("claude", { label: "Claude Code", modes: [mode("default", { colorTier: "safe" })] })]);
-  assert.deepEqual((await withGrok.registry.resolve({ kind: "auto" })).info, BUILTIN_INSIGHT_RUNNER);
-  const grokRunners = await withGrok.registry.runners();
-  assert.deepEqual([grokRunners.auto.runner, grokRunners.auto.available, grokRunners.auto.providerLabel, grokRunners.auto.access], [{ kind: "auto" }, true, "现在：Grok 4.7 · xhigh", "none"]);
-  assert.ok(listInsightRunners.output.safeParse(grokRunners).success);
-  const providers = (entries: unknown[], config: Record<string, unknown> = {}) => {
+test("auto never runs the Grok CLI: Codex, then a locked-down Claude Code, then providers that extend them", async () => {
+  const providers = (entries: unknown[], config: Record<string, unknown> = {}, codexToml: string | null = null) => {
     const paseo = { config: { get: async () => ({ config: { providers: config, agentProfiles: [] } }) }, providers: { snapshot: async () => ({ entries }) } } as unknown as PaseoApi;
-    return new InsightRunnerRegistry(paseo, { findBinary: async () => null });
+    return new InsightRunnerRegistry(paseo, { findBinary: async () => "/fake/grok", readCodexConfig: async () => codexToml });
   };
   const models = [{ provider: "claude", id: "claude-opus-5-5", label: "Opus 5.5", isDefault: true, thinkingOptions: [{ id: "high", label: "high", isDefault: true }] }];
-  const claude = await providers([entry("opencode", { modes: [mode("plan")] }), entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] }),
-    entry("claude", { label: "Claude Code", modes: [mode("default", { colorTier: "safe" })], models })]).resolve({ kind: "auto" });
-  assert.deepEqual([claude.info.kind, claude.info.provider, claude.model, claude.effort, claude.access], ["provider", "claude", "claude-opus-5-5", "high", "ask"]);
-  const codex = await providers([entry("opencode", { modes: [mode("plan")] }), entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] }),
-    entry("claude", { status: "unavailable" })]).resolve({ kind: "auto" });
-  assert.deepEqual([codex.info.provider, codex.info.modeId, codex.providerOptions], ["codex", "auto", { sandbox_mode: "read-only", approval_policy: "never" }]);
-  // The built-ins are off; custom providers that extend them are used, Claude-based first. Other providers never are.
-  const extendedRegistry = providers([entry("acp-reader", { modes: [mode("plan")] }), entry("codex-team", { modes: [mode("auto"), mode("full-access")] }), entry("claude-team", { modes: [mode("default", { colorTier: "safe" })] }), entry("claude"), entry("codex")],
+  // Grok is installed and Claude Code is the only usable provider: auto picks Claude Code in plan mode, not Grok.
+  const withGrok = providers([entry("claude", { label: "Claude Code", modes: claudeCodeModes, models })]);
+  const claude = await withGrok.resolve({ kind: "auto" });
+  assert.deepEqual([claude.info.kind, claude.info.provider, claude.model, claude.effort, claude.access, claude.info.modeId, claude.claudeLockdown], ["provider", "claude", "claude-opus-5-5", "high", "read", "plan", true]);
+  assert.deepEqual(claude.providerOptions!.disallowedTools, [...CLAUDE_DISALLOWED_TOOLS]); assert.equal(claude.mcpServers, undefined);
+  const grokRunners = await withGrok.runners();
+  assert.deepEqual([grokRunners.auto.available, grokRunners.auto.access], [true, "read"]); assert.ok(!grokRunners.auto.providerLabel?.includes("Grok"));
+  assert.ok(listInsightRunners.output.safeParse(grokRunners).success);
+  // Grok stays available when chosen by name.
+  assert.deepEqual((await withGrok.resolve({ kind: "grok" })).info, BUILTIN_INSIGHT_RUNNER);
+  // Claude Code with only Always Ask (no plan mode) is not usable.
+  await assert.rejects(providers([entry("claude", { modes: [mode("default", { colorTier: "safe" })] })]).resolve({ kind: "auto" }), error => error instanceof Error && error.message === NO_RUNNER_ERROR);
+  // Codex comes first, with its read-only sandbox and the user's MCP servers replaced by stubs.
+  const codex = await providers([entry("opencode", { modes: [mode("plan")] }), entry("claude", { label: "Claude Code", modes: claudeCodeModes, models }), entry("codex", { label: "Codex", modes: [mode("auto"), mode("full-access")] })],
+    {}, "[mcp_servers.gmail]\nurl = \"https://x\"\n").resolve({ kind: "auto" });
+  assert.deepEqual([codex.info.provider, codex.info.modeId, codex.providerOptions, codex.mcpServers], ["codex", "auto", READ_ONLY_CODEX,
+    { gmail: { type: "http", url: "http://127.0.0.1:9/mcp" }, paseo: { type: "stdio", command: "/usr/bin/false", args: [] } }]);
+  // The built-ins are off; custom providers that extend them are used, Codex-based first. Other providers never are.
+  const extendedRegistry = providers([entry("acp-reader", { modes: [mode("plan")] }), entry("codex-team", { modes: [mode("auto"), mode("full-access")] }), entry("claude-team", { modes: claudeCodeModes }), entry("claude"), entry("codex")],
     { claude: { enabled: false }, codex: { enabled: false }, "claude-team": { extends: "claude" }, "codex-team": { extends: "codex" }, "acp-reader": { extends: "acp" } });
   const extended = await extendedRegistry.resolve({ kind: "auto" });
-  assert.equal(extended.info.provider, "claude-team");
+  assert.equal(extended.info.provider, "codex-team");
+  // A custom provider that extends Claude Code is locked down the same way.
+  const claudeTeam = await extendedRegistry.resolve({ kind: "provider", provider: "claude-team", model: null, thinkingOptionId: null });
+  assert.deepEqual([claudeTeam.info.modeId, claudeTeam.access, claudeTeam.claudeLockdown], ["plan", "read", true]);
   // A custom provider that extends Codex (a proxy or a second account) keeps Codex's read-only sandbox.
   const codexTeam = await extendedRegistry.resolve({ kind: "provider", provider: "codex-team", model: null, thinkingOptionId: null });
-  assert.deepEqual([codexTeam.info.modeId, codexTeam.access, codexTeam.providerOptions], ["auto", "read", { sandbox_mode: "read-only", approval_policy: "never" }]);
+  assert.deepEqual([codexTeam.info.modeId, codexTeam.access, codexTeam.providerOptions], ["auto", "read", READ_ONLY_CODEX]);
   const none = providers([entry("acp-reader", { modes: [mode("plan")] }), entry("off", { enabled: false })], { "acp-reader": { extends: "acp" } });
   await assert.rejects(none.resolve({ kind: "auto" }), error => error instanceof Error && error.message === NO_RUNNER_ERROR);
   const empty = await none.runners();
@@ -93,7 +129,7 @@ test("auto runs the Grok CLI when it is installed, otherwise Claude Code, Codex,
 
 test("right after the daemon starts, the registry waits for provider discovery instead of calling them unusable (2.18)", async () => {
   const loading = [entry("claude", { label: "Claude Code", status: "loading", modes: [] })];
-  const ready = [entry("claude", { label: "Claude Code", modes: [mode("default", { colorTier: "safe" })] })];
+  const ready = [entry("claude", { label: "Claude Code", modes: claudeCodeModes })];
   let waited = 0;
   const paseo = { config: { get: async () => ({ config: { providers: {}, agentProfiles: [] } }) },
     providers: { snapshot: async () => ({ entries: loading }), waitForReady: async (options: { timeoutMs?: number }) => { waited++; assert.equal(options.timeoutMs, 8_000); return { entries: ready }; } } } as unknown as PaseoApi;
@@ -105,13 +141,13 @@ test("right after the daemon starts, the registry waits for provider discovery i
   await assert.rejects(new InsightRunnerRegistry(stuck, { findBinary: async () => null }).resolve({ kind: "auto" }));
 });
 
-test("runner registry retains unavailable profiles and cautions providers without read-only access", async () => {
+test("runner registry retains unavailable profiles and refuses providers that only ask before each tool", async () => {
   const f = catalogFixture([entry("disabled"), entry("error", { status: "error", error: "登录失效" }), entry("unavailable", { status: "unavailable" }), entry("default", { modes: [mode("default", { colorTier: "safe" })] })],
     [{ id: "disabled", name: "Disabled", provider: "disabled" }, { id: "missing", name: "Missing", provider: "missing" }, { id: "error", name: "Error", provider: "error" }], {}, { disabled: { enabled: false } });
   const runners = await f.registry.runners();
   assert.equal(runners.profiles.every(profile => !profile.available), true); assert.equal(runners.providers.some(provider => provider.provider === "disabled"), false);
-  const caution = runners.providers.find(provider => provider.provider === "default")?.reason ?? "";
-  assert.match(caution, /需要审批的工具请求会被自动拒绝/); assert.match(caution, /仍可能执行/); assert.equal(caution.includes("每个工具"), false);
+  const askOnly = runners.providers.find(provider => provider.provider === "default");
+  assert.equal(askOnly?.available, false); assert.match(askOnly?.reason ?? "", /不能用于分析/);
   await assert.rejects(f.registry.resolve({ kind: "profile", profileId: "disabled" }), /停用/); await assert.rejects(f.registry.resolve({ kind: "profile", profileId: "unknown" }), /找不到/);
   await assert.rejects(f.registry.models("error"), /登录失效/); await assert.rejects(f.registry.models("unavailable"), /不可用/);
 });
@@ -130,7 +166,7 @@ test("providers without listed modes, or with no read-only or ask-first mode, ca
 });
 
 test("ACP and OpenCode analyses switch auto-accept off explicitly; a child of an unattended Agent would otherwise inherit it", async () => {
-  const f = catalogFixture([entry("acp-agent", { modes: [mode("default"), mode("plan")] }), entry("opencode", { modes: [mode("build"), mode("plan")] }), entry("claude", { modes: [mode("default", { colorTier: "safe" })] }),
+  const f = catalogFixture([entry("acp-agent", { modes: [mode("default"), mode("plan")] }), entry("opencode", { modes: [mode("build"), mode("plan")] }), entry("claude", { modes: claudeCodeModes }),
     entry("codex", { modes: [mode("auto"), mode("full-access")] })], [{ id: "acp", name: "ACP", provider: "acp-agent", featureValues: { auto_accept: true, fast: "on" } }], {}, { "acp-agent": { extends: "acp" } });
   const acp = await f.registry.resolve({ kind: "profile", profileId: "acp" });
   assert.deepEqual([acp.info.modeId, acp.access, acp.featureValues], ["plan", "read", { fast: "on", auto_accept: false }]);
@@ -206,6 +242,30 @@ test("Paseo runner never creates a helper without a verified restricted mode", a
   }
   const f = runFixture(); await runPaseoStructured({ ...f.options, parent: { ...f.options.parent, workspaceId: null }, plan: { ...plan, featureValues: { auto_accept: false, permissionMode: "bypassPermissions", fast_mode: true } } });
   assert.deepEqual(f.created[0].config.featureValues, { auto_accept: false, fast_mode: true }); assert.equal(f.created[0].config.modeId, "auto");
+});
+
+test("a locked-down Claude helper also denies every tool the user's and the workspace's settings pre-approve", async () => {
+  const home = await mkdtemp(join(tmpdir(), "obs-claude-")), repo = await mkdtemp(join(tmpdir(), "obs-repo-"));
+  await writeFile(join(home, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(python -c:*)", "mcp__claude_ai_Linear__save_issue", "Read"] } }));
+  await mkdir(join(repo, ".claude")); await writeFile(join(repo, ".claude", "settings.local.json"), JSON.stringify({ permissions: { allow: ["mcp__github__create_gist"] } }));
+  const previous = process.env.CLAUDE_CONFIG_DIR; process.env.CLAUDE_CONFIG_DIR = home;
+  try {
+    const f = runFixture();
+    const locked: InsightRunnerPlan = { ...plan, info: { ...plan.info, provider: "claude", modeId: "plan" }, providerOptions: structuredClone(CLAUDE_LOCKDOWN_OPTIONS) as unknown as Record<string, unknown>, claudeLockdown: true };
+    await runPaseoStructured({ ...f.options, plan: locked, parent: { ...f.options.parent, cwd: repo, workspaceId: null } });
+    const options = f.created[0].config.options as { disallowedTools: string[]; extraArgs: unknown };
+    assert.deepEqual(options.disallowedTools, [...CLAUDE_DISALLOWED_TOOLS, "mcp__claude_ai_Linear__save_issue", "mcp__github__create_gist"]);
+    assert.deepEqual(options.extraArgs, { "strict-mcp-config": null }); assert.equal(f.created[0].config.modeId, "plan");
+    // A lockdown plan that lost its deny list never starts.
+    const g = runFixture();
+    await assert.rejects(runPaseoStructured({ ...g.options, plan: { ...locked, providerOptions: {} } }), /受限模式/); assert.equal(g.created.length + g.workspaceCreated.length, 0);
+  } finally { if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous; }
+});
+
+test("a Codex helper gets the plan's MCP stubs", async () => {
+  const f = runFixture();
+  await runPaseoStructured({ ...f.options, plan: { ...plan, mcpServers: { ...CODEX_PASEO_MCP_STUB } }, parent: { ...f.options.parent, workspaceId: null } });
+  assert.deepEqual(f.created[0].config.mcpServers, CODEX_PASEO_MCP_STUB);
 });
 
 test("Paseo runner uses an archived parent's existing workspace and errors when it cannot", async () => {

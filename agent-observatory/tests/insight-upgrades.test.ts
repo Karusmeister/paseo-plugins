@@ -29,6 +29,8 @@ async function wait(manager: InsightManager, id: string, statuses: InsightJob["s
 async function fixture(options: InsightManagerOptions = {}) {
   const directory = await mkdtemp(join(tmpdir(), "observatory-ai-upgrade-"));
   const manager = new InsightManager({ directory, now: () => epoch, findBinary: async () => "/fake", fetch: async (_p, id) => trajectory(id), run: async () => JSON.stringify(report()), ...options });
+  // These tests drive the Grok CLI path: `auto` no longer picks Grok, so choose it by name as a user would.
+  await manager.configure({ runner: { kind: "grok" } });
   return { directory, manager, async close() { await manager.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 test("migrates legal legacy history over eight megabytes without losing disabled settings", async () => {

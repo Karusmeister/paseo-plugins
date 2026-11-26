@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased (fork: security-hardening) · 2026-11-26
+
+**Analysis helpers can no longer act, even if a transcript prompt-injects them**
+- Claude Code (and providers that extend it) now run analyses in plan mode with every built-in tool and Paseo's MCP server denied, `--strict-mcp-config`, and the shell sandbox on. Every tool the user's or the workspace's Claude settings pre-approve (`permissions.allow`) is denied by name too: deny rules win over allow rules, so `Bash(...)`, `gh`, `git push` or MCP tools on the allowlist no longer run without a prompt. Before, the helper ran in Always Ask, where pre-approved tools ran unprompted and the auto-deny never saw them.
+- Codex keeps its read-only sandbox and now also has web search off, and Paseo's MCP server and the user's own `~/.codex/config.toml` MCP servers are replaced by stubs that exit at once (the sandbox does not cover MCP, and `approval_policy: never` would call them without asking).
+- Modes that only ask before each tool are no longer accepted as restricted for any provider.
+
+**Choose automatically never sends transcripts to xAI**
+- `auto` now picks Codex, then a locked-down Claude Code, then providers that extend them. The Grok CLI runs only when chosen by name, even when it is installed. Turn recaps are unchanged: their runner is shown as Grok and is chosen in their own settings.
+
 ## 2.20.0 · 2026-11-22
 
 **Agents in background workspaces can be shown (Paseo Bots chats)** (#17, for issue #16)

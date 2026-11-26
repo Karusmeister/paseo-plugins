@@ -2312,7 +2312,7 @@
   "serverInsightRunner": {
     "m001": "Choose automatically",
     "m002": "Grok CLI: no tools are offered and every tool call is refused. The session and its search record are deleted immediately after analysis",
-    "m003": "No analysis runner can be selected automatically. Install and sign in to Grok CLI, enable Claude Code or Codex in Paseo, or choose a profile or model in \"Analysis settings\"",
+    "m003": "No analysis runner can be selected automatically. Enable Codex or Claude Code in Paseo, or choose a profile, a model or the Grok CLI in \"Analysis settings\"",
     "m004": "This analysis session is read-only. Tools are unavailable. Output the JSON report directly.",
     "m005": "No read-only mode: tool requests requiring approval are automatically denied, but operations that need no approval, such as reading files, may still run",
     "m006": "This provider lists no permission modes, so analysis session restrictions cannot be confirmed. It cannot be used for analysis",
@@ -2327,7 +2327,7 @@
     "m015": "The selected analysis profile was not found. Choose the runner again",
     "m016": "Cannot start analysis: {reason}",
     "m017": "Local Grok CLI not found",
-    "m018": "Use Grok CLI when available; otherwise use an enabled Claude Code or Codex provider, including custom providers that extend them, with its default model",
+    "m018": "Use an enabled Codex provider (read-only sandbox), otherwise Claude Code with every tool denied, including custom providers that extend them, with its default model. The Grok CLI is used only when you choose it",
     "m019": "Now: {value1}",
     "m020": "Could not read analysis models: {reason}",
     "m021": "Analysis session cleanup timed out. It will be retried on the next load",
