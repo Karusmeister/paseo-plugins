@@ -8,7 +8,7 @@ import { ScrollView, copyText, useToast } from "@getpaseo/plugin/client/react-na
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { acknowledgement, applyReadReceipt, completionReadState, formatTokens, knownCompletionAt, observedRound, ownTurnRunning, parentServerOf, sameResultSource, stopUnseen, waitingKind, type AgentRecord } from "../shared/model";
-import { eventLabel, type TelemetrySnapshot } from "../shared/telemetry";
+import { eventLabel, setReplyAnswered, type TelemetrySnapshot } from "../shared/telemetry";
 import type { HeartbeatSummary } from "../shared/schedules";
 import { getSessionEvidence } from "../shared/history";
 import { getAgentResult, mergeAgentResult, type AgentResultState } from "../shared/results";
@@ -155,6 +155,19 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
     } catch (error) { toast.error(error instanceof Error ? error.message : t("coreAgentDetail.couldNotSyncReadStatus")); }
     finally { setReading(false); }
   };
+  // 已答复 / 待回复 (fork): take this Agent off 待回复 without sending it anything, or put it back. Names the reply on screen.
+  const setAnswered = useRpc(setReplyAnswered), [answering, setAnswering] = useState(false);
+  const markAnswered = async (answered: boolean) => {
+    if (!agent.replyAskedAt) return;
+    setAnswering(true);
+    try {
+      const answer = await setAnswered({ agentId: agent.id, replyAt: agent.replyAskedAt, answered });
+      if (answer.status === "ok") toast.show(answer.message, { variant: "success" }); else toast.error(answer.message);
+      await queryCache.invalidateQueries({ queryKey: telemetryQueryKey(hostId) });
+      invalidateAttention(hostId);
+    } catch (error) { toast.error(error instanceof Error ? error.message : t("coreAgentDetail.couldNotChangeAnswered")); }
+    finally { setAnswering(false); }
+  };
   const openConversation = () => { try { Promise.resolve(navigation?.openAgent({ agentId: agent.id })).catch(error => toast.error(t("coreAgentDetail.couldNotOpenSession", { value1: error instanceof Error ? error.message : t("coreAgentDetail.tryAgainLater") }))); } catch (error) { toast.error(t("coreAgentDetail.couldNotOpenSession", { value1: error instanceof Error ? error.message : t("coreAgentDetail.tryAgainLater") })); } };
   const openParent = (agentId: string, serverId: string) => {
     const failed = (error: unknown) => toast.error(t("coreAgentDetail.couldNotOpenParent", { value1: error instanceof Error ? error.message : t("coreAgentDetail.tryAgainLater") }));
@@ -184,11 +197,15 @@ export function AgentDetail({ hostId, agent, agents, theme, compact, navigation,
     : ackKind === "problem" ? { key: "read", label: t("coreAgentDetail.gotIt"), icon: "Check", onPress: () => void acknowledge(false), busy: reading } : null;
   const archive: Action | null = !agent.archivedAt && readState === "read" ? { key: "archive", label: t("coreAgentDetail.archive"), icon: "Archive", onPress: () => void archiveOriginal(), busy: archiving } : null;
   const restoreAction: Action | null = agent.archivedAt ? { key: "restore", label: restoring.restoring ? t("coreAgentDetail.restoring") : t("coreAgentDetail.restoreSession"), icon: "History", onPress: () => void restoreOriginal(), busy: restoring.restoring } : null;
+  const answeredAction: Action | null = !agent.archivedAt && agent.status === "idle" && agent.replyAskedAt && !agent.replyAnswered
+    ? { key: "answered", label: t("coreAgentDetail.markAnswered"), icon: "CircleCheck", onPress: () => void markAnswered(true), busy: answering } : null;
   const snoozeAction: Action | null = (ackKind === "result" || ackKind === "question") && snooze ? { key: "snooze", label: t("coreAgentDetail.snooze"), icon: "Clock3", onPress: snooze } : null;
-  const ordered = (agent.archivedAt ? [restoreAction, open] : [open, read, compact ? null : snoozeAction, archive]).filter((item): item is Action => !!item);
+  const ordered = (agent.archivedAt ? [restoreAction, open] : [open, read, compact ? null : answeredAction, compact ? null : snoozeAction, archive]).filter((item): item is Action => !!item);
   const variantOf = (action: Action, index: number): ButtonVariant => index === 0 ? "primary" : action.key === "read" || action.key === "next" || (agent.archivedAt && action.key === "open") ? "secondary" : "ghost";
   const menu: MenuAction[] = [
     ...(unread && onReadNext ? [{ key: "read-only", label: t("coreAgentDetail.markRead"), icon: "Check", hint: t("coreAgentDetail.stayOnThisResult"), disabled: reading || result.isPending, onPress: () => void acknowledge(false) }] : []),
+    ...(compact && answeredAction ? [{ key: "answered", label: answeredAction.label, icon: answeredAction.icon, hint: t("coreAgentDetail.markAnsweredHint"), disabled: answering, onPress: answeredAction.onPress }] : []),
+    ...(!agent.archivedAt && agent.replyAnswered ? [{ key: "awaiting", label: t("coreAgentDetail.markAwaitingReply"), icon: "MessageCircleQuestion", hint: t("coreAgentDetail.markAwaitingReplyHint"), disabled: answering, onPress: () => void markAnswered(false) }] : []),
     ...(compact && snoozeAction ? [{ key: "snooze", label: t("coreAgentDetail.snooze"), icon: "Clock3", hint: t("coreAgentDetail.remindIn1HourOrImmediatelyWhen"), onPress: snoozeAction.onPress }] : []),
     // refetch() forces a read even while the query waits, which would load an archived schedule session.
     ...(tab === "result" && !waitForTap ? [{ key: "refresh", label: t("coreAgentDetail.refreshResult"), icon: "RefreshCw", onPress: () => void result.refetch() }] : []),

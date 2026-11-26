@@ -149,7 +149,12 @@
     "couldNotOpenParent": "Couldn't open the parent agent: {value1}",
     "parentOnHost": "On {host}, opens in Paseo",
     "anotherHost": "another host",
-    "parentHost": "Parent agent's host"
+    "parentHost": "Parent agent's host",
+    "markAnswered": "Mark answered",
+    "markAnsweredHint": "No reply needed: take it off Awaiting reply. A newer reply puts it back",
+    "markAwaitingReply": "Mark awaiting reply",
+    "markAwaitingReplyHint": "Undo Mark answered: show it under Awaiting reply again",
+    "couldNotChangeAnswered": "Could not change the answered state. Try again later"
   },
   "coreAgentDigest": {
     "modelTimeShare": "{fraction} of the time was spent thinking and writing replies.",
@@ -2625,7 +2630,10 @@
     "m016": "Request approved",
     "m017": "Request denied or withdrawn",
     "m018": "Archived",
-    "m019": "Untitled agent"
+    "m019": "Untitled agent",
+    "replyMarkedAnswered": "Marked as answered. It is off Awaiting reply until the agent asks again.",
+    "replyMarkedAwaiting": "Marked as awaiting reply again.",
+    "replyAnsweredStale": "The agent has replied since. Nothing was changed; check the latest reply."
   },
   "serverTokensData": {
     "m001": "Unknown"

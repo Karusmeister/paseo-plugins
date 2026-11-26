@@ -137,7 +137,12 @@
     "couldNotOpenParent": "上级 Agent 打开失败：{value1}",
     "parentOnHost": "在 {host} 上，用 Paseo 打开",
     "anotherHost": "另一台主机",
-    "parentHost": "上级 Agent 所在主机"
+    "parentHost": "上级 Agent 所在主机",
+    "markAnswered": "标记为已答复",
+    "markAnsweredHint": "不需要回复：移出「待回复」。有新的回复时会重新出现",
+    "markAwaitingReply": "标记为待回复",
+    "markAwaitingReplyHint": "撤销「标记为已答复」：重新显示在「待回复」里",
+    "couldNotChangeAnswered": "无法更改答复状态，请稍后再试"
   },
   "coreAgentDigest": {
     "modelTimeShare": "{fraction} 的时间模型在思考和写回复。",
@@ -2415,7 +2420,10 @@
     "m016": "请求已批准",
     "m017": "请求被拒绝或撤销",
     "m018": "已归档",
-    "m019": "未命名 Agent"
+    "m019": "未命名 Agent",
+    "replyMarkedAnswered": "已标记为已答复。在 Agent 再次提问前不会出现在「待回复」里。",
+    "replyMarkedAwaiting": "已重新标记为待回复。",
+    "replyAnsweredStale": "Agent 之后又回复了，未做更改；请先查看最新回复。"
   },
   "serverTokensData": {
     "m001": "未知"

@@ -2,6 +2,11 @@
 
 ## Unreleased (fork: security-hardening) · 2026-11-26
 
+**Mark an agent awaiting a reply as answered, and undo it**
+- An agent whose last reply asks you something (待回复 / Awaiting reply) has **Mark answered** in its details (in the ⋯ menu on phones): it leaves Awaiting reply without anything being sent to it. **Mark awaiting reply** in the ⋯ menu puts it back.
+- The mark names the reply you saw and covers only replies written before it: when the agent replies again and asks, it is awaiting a reply again. A mark on a reply that has since been replaced is refused (`stale`).
+- Stored in the observatory's telemetry (`replyAnsweredAt`), written out before the answer, so it survives restarts and counts everywhere: the status, filters and counts, the sidebar labels and alerts, and quick replies (none for an answered reply). New RPC `observatory.reply.answered`.
+
 **The Grok CLI runner is removed; Claude Code replaces it**
 - Analyses, suggestions and turn summaries no longer run the Grok CLI: the plugin no longer looks for a `grok` binary, starts it, or cleans `~/.grok` sessions and `/tmp/paseo-insight-*` at startup. Nothing is sent to xAI.
 - The built-in choice in 分析设置 and 每轮小结 is now Claude Code with its default model, locked down as below. `auto` picks Claude Code, then Codex, then providers that extend them. Turn summaries default to `auto` and, like every helper, run at most once per Agent every 30 minutes.
